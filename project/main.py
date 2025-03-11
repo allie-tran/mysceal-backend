@@ -1,4 +1,6 @@
 import json
+import pandas as pd
+from io import BytesIO
 import logging
 from contextlib import asynccontextmanager
 from typing import List
@@ -525,3 +527,44 @@ async def annotate_segments(request: SegmentRequest):
         skip_merge=True,
     )
     return segments
+
+@app.post("/download-segments", description="Download segments", status_code=200)
+async def download_segments(request: SegmentRequest):
+    """
+    Download segments
+    """
+    event_segments = get_saved_segments(request.data, request.patient_id, request.date)
+    if not event_segments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Segments not found for {request.patient_id} on {request.date}",
+        )
+
+    fields = set()
+    for segment in event_segments.segments:
+        fields.update(segment.annotations.model_dump().keys())
+    # Write it into a CSV file with the following columns:
+    # Patient ID, Date, Image, Eating, Segment ID, [all other fields]
+    data = []
+    for i, segment in enumerate(event_segments.segments):
+        for image in segment.images:
+            row = {
+                "Patient ID": request.patient_id,
+                "Date": request.date,
+                "Image": image.src,
+                "Segment ID": f"{request.patient_id}_{request.date}_{i:03d}",
+                "Eating": segment.annotations.eating,
+            }
+            row.update(segment.annotations.model_dump())
+            row = {to_title_case(k): v for k, v in row.items()}
+            data.append(row)
+
+    # Write to CSV
+    file = BytesIO()
+    df = pd.DataFrame(data)
+    df.to_csv(file, index=False)
+    file.seek(0)
+    return StreamingResponse(file, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=segments.csv"})
+
+def to_title_case(string: str) -> str:
+    return " ".join([word.capitalize() for word in string.split("_")])
