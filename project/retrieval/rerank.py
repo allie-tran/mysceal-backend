@@ -1,11 +1,12 @@
 from typing import List
+import os
+
 import torch
 from configs import FORCE_CPU, IMAGE_DIRECTORY
-from PIL import Image
+from question_answering.video import get_collage_image
+from results.models import Event
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-
-from results.models import Event
 
 processor_path = "Qwen/Qwen2-VL-2B-Instruct"
 model_path = "lightonai/MonoQwen2-VL-v0.1"
@@ -25,10 +26,10 @@ class Reranker:
         )
 
     def score(self, query, image_paths):
-        images = []
-        for image_path in image_paths:
-            image = Image.open(f"{IMAGE_DIRECTORY}/{image_path}")
-            images.append(image)
+        image_paths = [os.path.join(IMAGE_DIRECTORY, image_path) for image_path in image_paths]
+        collage = get_collage_image(image_paths)
+        if not collage:
+            return 0.0
         prompt = (
             "Assert the relevance of the previous image document to the following query/question, "
             "answer True or False. The query is: {query}"
@@ -36,8 +37,8 @@ class Reranker:
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "image", "image": image} for image in images]
-                + [
+                "content": [
+                    {"type": "image", "image": collage},
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -46,7 +47,9 @@ class Reranker:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = self.processor(text=text, images=images, return_tensors="pt").to("cuda")
+        inputs = self.processor(text=text, images=[collage], return_tensors="pt").to(
+            "cuda"
+        )
 
         # Run inference to obtain logits
         with torch.no_grad():
@@ -70,13 +73,62 @@ class Reranker:
         return scores
 
     def rerank_scenes(self, query: str, scenes: List[Event]):
-        scores = []
+        scores: List[float] = []
         print(f"Reranking {len(scenes)} scenes")
         for scene in tqdm(scenes):
-            score = self.score(query, [image.src for image in scene.images][:1])
+            score = self.score(query, [image.src for image in scene.images])
             scores.append(score)
         return scores
 
+    def merge_segments(self, segment1: list[str], segment2: list[str]):
+        def local_get_collage_image(image_paths):
+            image_paths = [os.path.join(IMAGE_DIRECTORY, image_path) for image_path in image_paths]
+            collage = get_collage_image(image_paths)
+            return collage
 
-reranker = None
-# reranker = Reranker(processor_path, model_path)
+        collage1 = local_get_collage_image(segment1)
+        collage2 = local_get_collage_image(segment2)
+
+        if not collage1 or not collage2:
+            return 1.0
+
+        prompt = "Decide if the following two image documents belong to the same (eating) activity, answer True or False."
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": collage1},
+                    {"type": "image", "image": collage2},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        # Apply chat template and tokenize
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(text=text, images=[collage1, collage2], return_tensors="pt").to(
+            "cuda"
+        )
+
+        # Run inference to obtain logits
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            logits_for_last_token = outputs.logits[:, -1, :]
+
+        # Convert tokens and calculate relevance score
+        true_token_id = self.processor.tokenizer.convert_tokens_to_ids("True")
+        false_token_id = self.processor.tokenizer.convert_tokens_to_ids("False")
+        relevance_score = torch.softmax(
+            logits_for_last_token[:, [true_token_id, false_token_id]], dim=-1
+        )
+
+        # Extract and display probabilities
+        true_prob = relevance_score[0, 0].item()
+        return true_prob
+
+
+
+# reranker = None
+reranker = Reranker(processor_path, model_path)
+print("Reranker initialized")

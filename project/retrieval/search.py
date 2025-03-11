@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
 from configs import FILTER_FIELDS, MAX_IMAGES_PER_EVENT, MERGE_EVENTS
 from database.main import get_db, group_collection, image_collection, scene_collection
@@ -23,7 +24,11 @@ from query_parse.extract_info import (
     create_query,
     modify_es_query,
 )
-from query_parse.question import detect_question, question_to_retrieval
+from query_parse.question import (
+    detect_question,
+    question_classification,
+    question_to_retrieval,
+)
 from query_parse.types.elasticsearch import (
     ESBoolQuery,
     ESEmbedding,
@@ -77,7 +82,7 @@ from results.utils import (
 from rich import print
 
 from retrieval.async_utils import async_generator_timer, async_timer
-from retrieval.dynamic_segmentation import get_segments
+from retrieval.dynamic_segmentation import get_segments, get_segments_2
 from retrieval.graph_utils import get_deakin_heatmap_per_hours, get_heatmap_data
 from retrieval.search_utils import (
     get_raw_search_results,
@@ -137,8 +142,10 @@ async def streaming_manager(request: GeneralQueryRequest) -> AsyncGenerator[str,
                 print(f"[red]Yielding response[/red]", response.type)
                 print(f"[red]Size of the response[/red]", len(response.response))
                 print("[red]" + "-" * 50 + "[/red]")
+                now = time.time()
                 data = response.model_dump_json(by_alias=True)
                 yield f"data: {data}\n\n"
+                print("[red]Time taken to yield[/red]", time.time() - now)
 
         print("[blue]ALl Done[/blue]")
         yield "data: END\n\n"
@@ -180,20 +187,41 @@ async def simple_search(
     # test
     db = get_db(data)
     mongo_query = request.mongo_match
-    print("[green]Data[/green]", data)
-    print("[green]Mongo Query[/green]", mongo_query)
+    mongo_scores = {}
+    images = None
     if mongo_query:
-        images_cursor = image_collection(db).find(
-            mongo_query, {"image": 1}
-        )  # Project only the required field
-        images = {
-            doc["image"] for doc in images_cursor
-        }  # Use a set comprehension directly on the cursor
-        print("[green]Images found[/green]", len(images))
-    else:
-        images = None
+        if mongo_query["filters"] or mongo_query["must_not"]:
+            find_query = {
+                **mongo_query["filters"],
+                **mongo_query["must_not"],
+            }
+            print("[green]Filter Mongo Query[/green]", find_query)
+            image_cursor = image_collection(db).find(find_query, {"image": 1})
+            images = {doc["image"] for doc in image_cursor}
+            print("[green]Filtered images found[/green]", len(images))
 
-    segment_res = get_segments(main_query.query, data, max_gap=5, filters=images)
+        if mongo_query["scores"]:
+            find_query = {
+                **mongo_query["scores"],
+                **mongo_query["filters"],
+            }
+            print("[green]Score Mongo Query[/green]", find_query)
+
+            image_cursor = image_collection(db).find(
+                find_query, {"image": 1, "score": {"$meta": "textScore"}}
+            )
+            for doc in image_cursor:
+                mongo_scores[doc["image"]] = doc["score"]
+            print("[green]Images with scores found[/green]", len(mongo_scores))
+
+    segment_res = get_segments(
+        main_query.query,
+        data,
+        max_gap=5,
+        filters=images,
+        size=size,
+        metadata_scores=mongo_scores,
+    )
     if not segment_res["segments"]:
         print("[red]No segments found[/red]")
         return AsyncioTaskResult(task_type="search", tag=tag, results=results)
@@ -208,16 +236,25 @@ async def simple_search(
     )
 
     print("[green]Events found[/green]", len(events))
-    es_results = EventResults(events=events, scores=segment_res["segment_scores"][:size])
+    es_results = EventResults(
+        events=events, scores=segment_res["segment_scores"][:size]
+    )
 
     # The scores are on a x-axis of time
     # We can visualize the scores in a heatmap like git commit history
     # of the scores
-    visualisation_data = get_heatmap_data(data, segment_res["scores"], segment_res["high_score_indices"])
+    visualisation_data = get_heatmap_data(
+        data, segment_res["scores"], segment_res["high_score_indices"]
+    )
     filter_fields = main_query.filters
     if filter_fields and filter_fields.patient_id:
         visualisation_data.extend(
-            get_deakin_heatmap_per_hours(data, segment_res["scores"], segment_res["high_score_indices"], filter_fields.patient_id)
+            get_deakin_heatmap_per_hours(
+                data,
+                segment_res["scores"],
+                segment_res["high_score_indices"],
+                filter_fields.patient_id,
+            )
         )
 
     # # end test
@@ -234,7 +271,9 @@ async def simple_search(
     return AsyncioTaskResult(task_type="search", tag=tag, results=results)
 
 
-def get_segments_only(main_text: str, filters: EatingFilters, data: Data) -> List[Event]:
+def get_segments_only(
+    main_text: str, filters: EatingFilters, data: Data
+) -> Tuple[List[Event], int, List[bool]]:
     """
     Get the segments only
     """
@@ -245,34 +284,71 @@ def get_segments_only(main_text: str, filters: EatingFilters, data: Data) -> Lis
     if [x for x in filters.date if x]:
         mongo_query["date"] = {"$in": filters.date}
     print("[green]Mongo Query[/green]", mongo_query)
-    images_cursor = image_collection(db).find(
-        mongo_query, {"image": 1}
-    )
-    images = {
-        doc["image"] for doc in images_cursor
-    }
+    images_cursor = (
+        image_collection(db).find(mongo_query, {"image": 1}).sort("image", 1)
+    )  # Project only the required field
+    images = [doc["image"] for doc in images_cursor]
+    first_image = images[0] if images else None
+    last_image = images[-1] if images else None
+    images = set(images)
+    first_index = photo_ids(data).index(first_image)
+    last_index = photo_ids(data).index(last_image)
+
     if len(images) == 0:
         print("[red]No images found[/red]")
-        return []
+        return [], 0, []
+
     print("[green]Images found[/green]", len(images))
-    segment_res = get_segments(main_text, data, max_gap=5, filters=images, to_merge=True)
+    # segment_res = get_segments(main_text, data, max_gap=5, filters=images, to_merge=True)
+    segment_res = get_segments_2(main_text, data, filters=images)
+    eating = []
     if not segment_res["segments"]:
         print("[red]No segments found[/red]")
-        return []
-    print("[green]Total segments found[/green]", len(segment_res["segments"]))
-    # Ignore the score and just sort by time
-    ids = sorted(
-        range(len(segment_res["segments"])),
-        key=lambda x: segment_res["segments"][x][0],
-    )
+        # return the full list of images
+        all_segments = [(first_index, last_index)]
+        all_scores = [-1]
+        eating = [False]
+    else:
+        eating = []
+        print("[green]Total segments found[/green]", len(segment_res["segments"]))
+        # Ignore the score and just sort by time
+        ids = sorted(
+            range(len(segment_res["segments"])),
+            key=lambda x: segment_res["segments"][x][0],
+        )
+        # Add in the segments inbetween
+        all_segments = []
+        all_scores = []
+        i = 0
+        while i < len(ids):
+            start, end = segment_res["segments"][ids[i]]
+            if first_index < start:
+                eating.append(False)
+                all_segments.append((first_index, start))
+                all_scores.append(-1)
+            all_segments.append((start, end))
+            all_scores.append(segment_res["segment_scores"][ids[i]])
+            eating.append(True)
+            i += 1
+            first_index = end
+        if first_index < last_index:
+            all_segments.append((first_index, last_index))
+            all_scores.append(-1)
+            eating.append(False)
+
+        print(
+            "[green]Both eating and non-eating segments found[/green]",
+            len(all_segments),
+        )
+
     events = segments_to_events(
         data,
-        [segment_res["segments"][i] for i in ids],
-        [segment_res["segment_scores"][i] for i in ids],
+        all_segments,
+        all_scores,
         photo_ids(data),
     )
     print("[green]Events found[/green]", len(events))
-    return events
+    return events, len(images), eating
 
 
 class AnswerModel(BaseModel):
@@ -347,12 +423,12 @@ async def single_query(
     """
     Search (and answer) a single query
     """
+    now = time.time()
 
     if not pipeline:
         pipeline = SearchPipeline()
 
     step = Step(step=1, total=2)
-    print("[green]Filters[/green]", filters)
     # ============================= #
     # 1. Query Parser (no skipping but modifiable)
     # ============================= #
@@ -378,12 +454,14 @@ async def single_query(
             FunctionWithArgs(  # no skipping
                 function=create_es_combo_query,
                 use_previous_output=True,
-                kwargs={"ignore_limit_score": False},
+                kwargs={"ignore_limit_score": True},
                 output_name="es_query",
                 is_async=True,
             ),
         ]
     )
+
+    print("--> Query Parser", time.time() - now)
 
     if output["is_question"]:
         step.total = 4
@@ -405,11 +483,13 @@ async def single_query(
         tag="single",
         filter_fields=not skip_extract,
     )
+
     # ----------------------------- #
     # b. Start the async tasks
     results = None
     relevant_fields = RelevantFields()
 
+    now = time.time()
     for future in asyncio.as_completed(async_tasks):
         res = await future
         if res.task_type == "search":
@@ -427,14 +507,17 @@ async def single_query(
                     response=results.heatmap,
                     progress=step.progress(),
                 )
+            print("--> Search", time.time() - now)
         elif res.task_type == "llm":
             relevant_fields = res.results
             field_extractor.add_output(relevant_fields.model_dump())
+            print("--> Field Extractor", time.time() - now)
 
     if results is None:
         print("[red]single_query: No results found[/red]")
         return
 
+    now = time.time()
     # ============================= #
     # 3. Processing the results
     # ============================= #
@@ -481,6 +564,8 @@ async def single_query(
                 )
             ]
         )["results"]
+
+    print("--> Processing", time.time() - now)
 
     # ----------------------------- #
     # d. Check if anything changed
@@ -541,11 +626,13 @@ def get_search_tasks(
     tag: str = "",
     filter_fields: bool = FILTER_FIELDS,
 ) -> List[asyncio.Task]:
-    tasks = [simple_search(main_query, data, size, tag, mode=Mode.event)]
-    # Starting the async tasks
+    tasks = []
+
+    tasks.append(simple_search(main_query, data, size, tag, mode=Mode.event))
     if filter_fields and text:
         tasks.append(get_relevant_fields(text, tag))
 
+    # Starting the async tasks
     async_tasks = [asyncio.create_task(task) for task in tasks]
     return async_tasks
 
@@ -555,9 +642,15 @@ async def get_answer_tasks(
     results: EventResults,
     relevant_fields: List[str],
 ) -> AsyncGenerator[List[AnswerResult], None]:
-    options = await get_answer_models(text)
-    print("[yellow]Answering the question with configs[/yellow]", options)
+    question_type = await question_classification(text)
+    print("[yellow]Question Type[/yellow]", question_type)
+    match question_type:
+        case "frequency" | "time":
+            options = {"text": AnswerModel(), "visual": AnswerModel(enabled=False)}
+        case _:
+            options = await get_answer_models(text)
 
+    print("[yellow]Answering the question with configs[/yellow]", options)
     text_model = options.get("text", AnswerModel())
     visual_model = options.get("visual", AnswerModel())
 
@@ -582,8 +675,8 @@ async def get_answer_tasks(
     )
 
     async_tasks: Sequence = [
+        answer_visual_only(text, textual_descriptions, results, 5),
         answer_text_only(text, textual_descriptions, k),
-        answer_visual_only(text, textual_descriptions, results, visual_model.top_k),
     ]
 
     for task in async_tasks:
@@ -686,7 +779,7 @@ async def two_queries(
 
     # Send the search request
     print("[green]Sending the multi-search request...[/green]")
-    msearch_results = await send_multiple_search_request(msearch_query)
+    msearch_results = await send_multiple_search_request(data, msearch_query)
 
     if not msearch_results:
         print("[red]two queries - msearch: No results found[/red]")
@@ -966,7 +1059,7 @@ async def search_similar_events(image: str, data: Data) -> Optional[EventResults
 
     # Find the similar events
     es = ESBoolQuery()
-    es.must.append(ESEmbedding(embedding=image_feat.tolist()))
+    es.must.append(ESEmbedding(embedding=image_feat.tolist(), text=""))
 
     result = await simple_search(es, size=200, data=data, tag="similar")
     if not result.results or not result.results.events:
@@ -1000,18 +1093,19 @@ async def answer_single_event(
     textual_description = get_specific_description(event, request.relevant_fields)
 
     images = [Image(**x) for x in scene["images"]]
-
     this_image = [x for x in images if x.src == image][0]
 
-    # Get 2 other highest scoring images
+    # Get up to 9 highest scoring images
     if len(event.images) > 1:
         other_images = [x for x in event.images if x.src != image]
-        encoded_query = encode_text(request.question, get_model(data))
-        visual_scores = score_images(other_images, encoded_query, get_model(data))
+        encoded_query = encode_text(request.question, chosen_model=get_model(data))
+        visual_scores = score_images(
+            other_images, encoded_query, data, chosen_model=get_model(data)
+        )
         sorted_images = sorted(
             zip(other_images, visual_scores), key=lambda x: x[1], reverse=True
         )
-        images = [this_image] + [x[0] for x in sorted_images[:2]]
+        images = [this_image] + [x[0] for x in sorted_images[:8]]
     else:
         images = [this_image]
 

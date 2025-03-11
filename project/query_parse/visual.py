@@ -1,5 +1,4 @@
 import os
-from rich import print
 from typing import List, Tuple
 
 import numpy as np
@@ -19,6 +18,8 @@ from open_clip.model import CLIP
 from open_clip.tokenizer import _tokenizer
 from PIL import Image as PILImage
 from results.models import Image
+from retrieval.async_utils import timer
+from rich import print
 from transformers import AutoModel, AutoProcessor
 
 from query_parse.types.requests import Data
@@ -29,8 +30,8 @@ from .utils import search_keywords
 
 # Load CLIP Model
 device = "cpu"
-# if not FORCE_CPU and torch.cuda.is_available():  # type: ignore
-#     device = "cuda"
+if torch.cuda.is_available():  # type: ignore
+    device = "cuda"
 
 
 def load_features(paths):
@@ -112,6 +113,7 @@ def _split_text(text: str, context_length: int) -> List[str]:
 
 class ClipModel:
     def __init__(self):
+        self.name = "clip"
         clip_model, _, preprocess = open_clip.create_model_and_transforms(
             MODEL_NAME, pretrained=PRETRAINED_DATASET, device=device
         )
@@ -121,6 +123,9 @@ class ClipModel:
         self.clip_model = clip_model
         self.preprocess = preprocess
         self.tokenizer = tokenizer
+
+        self.clip_model = self.clip_model.to(device)
+        self.clip_model.eval()
 
         # LSC23 dataset
         lsc_paths = [
@@ -158,6 +163,7 @@ class ClipModel:
             Data.Deakin: deakin_photo_ids,
         }
 
+    @timer("CLIP encode text")
     def encode_text(self, main_query: str) -> np.ndarray:
         with torch.no_grad():
             sentences = _split_text(main_query, 77)
@@ -182,9 +188,8 @@ class ClipModel:
         return image_feat.cpu().numpy()
 
     def score_images(
-        self, image_objs: List[Image], encoded_query: np.ndarray, data: Data
+        self, images: List[str], encoded_query: np.ndarray, data: Data
     ) -> List[float]:
-        images = [image.src for image in image_objs]
         try:
             encoded_query /= LA.norm(encoded_query, keepdims=True, axis=-1)
         except TypeError:
@@ -216,6 +221,7 @@ class ClipModel:
 
 class SIGLIP(ClipModel):
     def __init__(self):
+        self.name = "siglip"
         model = AutoModel.from_pretrained(
             "google/siglip-so400m-patch14-384",
             device_map=device,
@@ -226,6 +232,9 @@ class SIGLIP(ClipModel):
         )
         self.model = model
         self.processor = processor
+
+        self.model.eval()
+        self.model.to(device)
 
         # LSC23 dataset
         lsc_paths = [
@@ -239,20 +248,27 @@ class SIGLIP(ClipModel):
         # Both datasets
         self.combine_datasets(lsc_paths, deakin_paths)
 
+    @timer("SIGLIP encode text")
     def encode_text(self, main_query: str) -> np.ndarray:
+        sentences = _split_text(main_query, 77)
         inputs = self.processor(
-            text=[main_query], return_tensors="pt", padding=True, truncation=True
+            text=sentences,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
         )
+        inputs.to(device)
         with torch.no_grad():
-            outputs = self.model.get_text_features(**inputs).mean(dim=0)
-        return outputs.cpu().numpy().astype("float")
+            with torch.autocast(device):
+                outputs = self.model.get_text_features(**inputs).mean(dim=0)
+        return outputs.cpu().float().numpy()
 
     def encode_image(self, image_path: str) -> np.ndarray:
         image_read = PILImage.open(f"{IMAGE_DIRECTORY}/{image_path}")
         photo_preprocessed = self.processor(images=image_read, return_tensors="pt")
         with torch.no_grad():
             outputs = self.model.get_image_features(**photo_preprocessed)
-        return outputs.cpu().numpy().astype("float")
+        return outputs.cpu().float().numpy()
 
 
 # This is for Deakin dataset
@@ -260,6 +276,7 @@ class CLIPA(ClipModel):
     def __init__(
         self, model_name: str = "hf-hub:UCSC-VLAA/ViT-L-14-CLIPA-336-datacomp1B"
     ):
+        self.name = "clipa"
         clip_model, _, preprocess = open_clip.create_model_and_transforms(
             model_name, device=device
         )
@@ -325,5 +342,6 @@ def norm_photo_features(data: Data):
 def photo_ids(data: Data):
     chosen_model = get_model(data)
     return chosen_model.photo_ids[data]
+
 
 print("visual.py loaded")

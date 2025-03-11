@@ -150,6 +150,10 @@ class ImageInfoRequest(TemplateRequest):
 class SegmentRequest(TemplateRequest):
     patient_id: str = ""
     date: str = ""
+    use_cache: bool = True
+
+class ExpandSegmentRequest(SegmentRequest):
+    image: str = ""
 
 # ====================== #
 # MAP REQUESTS
@@ -212,6 +216,10 @@ class AnswerThisRequest(TemplateRequest):
 class ChoicesRequest(TemplateRequest):
     field: str
     condition: Optional[dict[str, Any]] = None
+
+class ChoicesResponse(CamelCaseModel):
+    choices: List[str]
+    annotations: List[str] = []
 
 
 AnyRequest = Union[

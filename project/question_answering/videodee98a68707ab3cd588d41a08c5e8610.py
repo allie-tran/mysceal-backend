@@ -1,5 +1,6 @@
 import base64
 import os
+import time
 from collections.abc import AsyncGenerator
 from io import BytesIO
 from math import ceil
@@ -10,7 +11,6 @@ from llm import vllm_model
 from llm.models import MixedContent
 from llm.prompts import MIXED_PROMPTS
 from PIL import Image as PILImage
-from query_parse.types.requests import Data
 from results.models import AnswerResult, Event, GenericEventResults, Image
 from retrieval.async_utils import async_generator_timer
 from rich import print as rprint
@@ -194,12 +194,13 @@ def to_base64(image_path: str) -> str:
         return f"data:image/jpeg;base64,{b64}"
 
 
-def get_collage_image(image_paths: List[str]):
+def get_openai_visual_message(image_paths: List[Image]) -> MixedContent | None:
+    images = [os.path.join(IMAGE_DIRECTORY, img.src) for img in image_paths]
     image_objs = []
-    for image in image_paths:
+    for image in images:
         try:
             image_objs.append(PILImage.open(image))
-        except Exception:
+        except Exception as e:
             print("Error opening image", image)
             continue
     if len(image_objs) == 0:
@@ -224,18 +225,6 @@ def get_collage_image(image_paths: List[str]):
         x_offset = (index % col) * min_size[0]
         y_offset = (index // col) * min_size[1]
         collage.paste(img, (x_offset, y_offset))
-
-    return collage
-
-
-def get_openai_visual_message(image_paths: List[Image], data: Data = Data.LSC23) -> MixedContent | None:
-    if data == Data.Deakin:
-        images = [os.path.join(IMAGE_DIRECTORY, "Deakin", img.src) for img in image_paths]
-    else:
-        images = [os.path.join(IMAGE_DIRECTORY, img.src) for img in image_paths]
-    collage = get_collage_image(images)
-    if not collage:
-        return None
 
     # save the collage to a jpeg file
     file = BytesIO()

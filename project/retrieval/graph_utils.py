@@ -32,6 +32,7 @@ def get_heatmap_data(data: Data, scores: List[float], high_score_indices: List[i
     """
     if data == Data.Deakin:
         return get_deakin_heatmap_data(data, scores, high_score_indices)
+    # return []
     return [get_lsc_heatmap_data(data, scores, high_score_indices)]
 
 
@@ -85,11 +86,11 @@ def get_lsc_heatmap_data(
     )
 
     values = df.to_dict("split")["data"]
-    # replace 0s with None
-    for i in range(len(values)):
-        for j in range(len(values[i])):
-            if values[i][j] == 0:
-                values[i][j] = None
+    # # replace 0s with None
+    # for i in range(len(values)):
+    #     for j in range(len(values[i])):
+    #         if values[i][j] == 0:
+    #             values[i][j] = None
 
     # Hover info: the actual date
     hover_info = []

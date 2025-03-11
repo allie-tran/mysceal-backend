@@ -6,8 +6,8 @@ import re
 from collections import defaultdict
 
 from configs import QUERY_PARSER
-from llm import gpt_llm_model, llm_model
-from llm.prompt.parse import PARSE_QUERY, REWRITE_QUERY, REWRITE_QUESTION
+from llm import llm_model
+from llm.prompt.parse import PARSE_NEGATION, PARSE_QUERY, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION
 from rich import print as rprint
 
 from query_parse.types.lifelog import EatingFilters, ParsedQuery, SingleQuery
@@ -46,6 +46,7 @@ async def question_to_retrieval(text: str, is_question: bool) -> str:
         return text
 
     prompt = REWRITE_QUESTION.format(question=text)
+    print("Converting question to retrieval query")
     search_text = await llm_model.generate_from_text(prompt)
     if isinstance(search_text, dict) and "text" in search_text:
         search_text = search_text["text"]
@@ -61,7 +62,7 @@ def detect_simple_query(query: str) -> bool:
     """
     words = query.split()
     words = [word for word in words if word not in STOP_WORDS]
-    return len(words) < 3
+    return len(words) < 5
 
 
 async def parse_query(
@@ -77,43 +78,84 @@ async def parse_query(
         "must_not": defaultdict(str),
     }
 
-    if QUERY_PARSER or is_question or eating_filters:
-        # in some cases, it's inefficient to parse the query
-        if eating_filters is None and detect_simple_query(text):
-            main = SingleQuery(visual=text, location=text, time=text, date=text)
-            return ParsedQuery(main=main)
-
-        eating_query = eating_filters.format() if eating_filters else ""
-        if eating_query:
-            eating_query = f"Eating filters: {eating_query}"
-
-        prompt = REWRITE_QUERY.format(query=text, eating_filters=eating_query)
-        search_text = await llm_model.generate_from_text(prompt)
-        if isinstance(search_text, dict) and "text" in search_text:
-            print(search_text)
-            text = search_text["text"]
-
-        prompt = PARSE_QUERY.format(
-            query=text, eating_filters=eating_query
-        )
-        feat = await gpt_llm_model.generate_from_text(prompt)
-
-        if isinstance(feat, dict):
-            for key, value in feat.items():
-                if key in template:
-                    query = template[key]
-
-                    for k, v in value.items():
-                        query[k] = v
-
-                    # add location into main
-                    if "location" in query and "visual" in query:
-                        if query["location"] != query["visual"]:
-                            query["visual"] = query["visual"] + " " + query["location"]
-
+    prompt = PARSE_NEGATION.format(query=text)
+    response = await llm_model.generate_from_text(prompt)
+    if isinstance(response, dict) and "text" in response:
+        print(response)
+        text = response["text"]
+        main = SingleQuery(visual=text, location=text, time=text, date=text)
+        must_not = response.get("must_not", "")
+        if must_not:
+            must_not = SingleQuery(visual=must_not, location=must_not, time=must_not, date=must_not)
+            return ParsedQuery(main=main, must_not=must_not)
         else:
-            print("Failed to parse query")
-            print(feat)
+            return ParsedQuery(main=main)
+    main = SingleQuery(visual=text, location=text, time=text, date=text)
+    return ParsedQuery(main=main)
+
+    if QUERY_PARSER or is_question or eating_filters:
+        pass
+        # # in some cases, it's inefficient to parse the query
+        # if eating_filters is None and detect_simple_query(text):
+        #     main = SingleQuery(visual=text, location=text, time=text, date=text)
+        #     return ParsedQuery(main=main)
+
+        # eating_query = eating_filters.format() if eating_filters else ""
+        # if eating_query:
+        #     eating_query = f"Eating filters: {eating_query}"
+
+        # prompt = REWRITE_QUERY.format(query=text, eating_filters=eating_query)
+        # search_text = await llm_model.generate_from_text(prompt)
+        # if isinstance(search_text, dict) and "text" in search_text:
+        #     print(search_text)
+        #     text = search_text["text"]
+
+        # prompt = PARSE_QUERY.format(
+        #     query=text, eating_filters=eating_query
+        # )
+        # feat = await llm_model.generate_from_text(prompt)
+        # if isinstance(feat, dict):
+        #     for key, value in feat.items():
+        #         if key in template:
+        #             query = template[key]
+        #             for k, v in value.items():
+        #                 query[k] = v
+
+        #             # add location into main
+        #             if "location" in query and "visual" in query:
+        #                 if query["location"] != query["visual"]:
+        #                     query["visual"] = query["visual"] + " " + query["location"]
+
+        # else:
+        #     print("Failed to parse query")
+        #     print(feat)
 
     parsed_query = ParsedQuery.model_validate(template)
     return parsed_query
+
+
+async def question_classification(question):
+    FREQUENCY_QUESTION = ["how often", "how many times", "how frequently"]
+    TIME_QUESTION = ["when", "what time", "how long", "how much time", "what date", "what month", "how long"]
+    LOCATION_QUESTION = ["where", "what place", "what location", "what area", "what city", "what country", "which country", "which city", "which area", "name of the place", "name of the location", "name of the area", "name of the city", "name of the country"]
+
+    question = question.lower()
+    if any(word in question for word in FREQUENCY_QUESTION):
+        return "frequency"
+    if any(word in question for word in TIME_QUESTION):
+        return "time"
+    if any(word in question for word in LOCATION_QUESTION):
+        return "location"
+
+    prompt = QUESTION_CLASSIFICATION.format(question=question)
+    response = await llm_model.generate_from_text(prompt)
+    if isinstance(response, dict) and "category" in response:
+        return response["category"]
+    else:
+        rprint(response)
+        return "visual"
+
+
+
+
+

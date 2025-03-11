@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 import pandas as pd
-from llm import gpt_llm_model
+from llm import llm_model
 from llm.prompt.organize import GRAPH_QUERY
 from pydantic import ValidationError
 from query_parse.extract_info import create_es_combo_query, create_query
@@ -203,7 +203,7 @@ async def get_vegalite(query: str, data: Data):
     graph_data = {}
     while True:
         try:
-            graph_data = await gpt_llm_model.generate_from_text(prompt)
+            graph_data = await llm_model.generate_from_text(prompt)
             if graph_data:
                 rprint("Vegetalite data found", graph_data)
                 if "data" not in graph_data:

@@ -8,6 +8,7 @@ from llm import llm_model
 from llm.prompts import QA_PROMPT
 from query_parse.time import calculate_duration
 from results.models import AnswerListResult, AnswerResult, Event
+from rich import print as rprint
 
 
 def get_general_textual_description(event: Event) -> str:
@@ -135,6 +136,7 @@ async def answer_text_only(
                     )
                     for answer in llm_response["answers"]
                 ]
+                rprint(answers)
                 yield answers
             except Exception:
                 print("GROQ", llm_response)

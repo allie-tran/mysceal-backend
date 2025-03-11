@@ -10,13 +10,14 @@ from llm.models import LLM
 GROQ_AI = os.environ.get("GROQ_API", "")
 MODEL_NAME = os.environ.get("GROQ_MODEL_NAME", "")
 
-models = ["gemma2-9b-it", "llama3-70b-8192", "llama-3.1-70b-versatile", "mixtral-8x7b-32768", "llama-3.2-90b-text-preview"]
+models = ["llama-3.1-70b-versatile", "mixtral-8x7b-32768", "llama-3.3-70b-versatile", "llama-3.3-70b-specdec"]
 
 # llama3-70b-8192 ok - didn't answer
 # llama-3.1-70b-versatile too slow
 # mixtral-8x7b-32768 - normal
 
-MODEL_NAME = "mixtral-8x7b-32768"
+# MODEL_NAME = "mixtral-8x7b-32768"
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 class GroqLLM(LLM):
     def __init__(self):
@@ -32,27 +33,33 @@ class GroqLLM(LLM):
             temperature=0.1,
         )
 
-        buffer = []
-        loop = asyncio.get_event_loop()
-        done = False
+        await asyncio.sleep(0)
+        for chunk in request:
+            await asyncio.sleep(0)
+            if chunk.choices[0].delta.content is not None:
+                yield chunk.choices[0].delta.content
 
-        async def yield_buffer():
-            while not done:
-                await asyncio.sleep(1)
-                if buffer:
-                    yield "".join(buffer)
-                    buffer.clear()
+        # buffer = []
+        # loop = asyncio.get_event_loop()
+        # done = False
 
-        async def accumulate_chunks():
-            nonlocal done
-            for chunk in request:
-                if chunk.choices[0].delta.content is not None:
-                    buffer.append(chunk.choices[0].delta.content)
-            done = True
+        # async def yield_buffer():
+        #     while not done:
+        #         await asyncio.sleep(1)
+        #         if buffer:
+        #             yield "".join(buffer)
+        #             buffer.clear()
 
-        loop.create_task(accumulate_chunks())
-        async for completion in yield_buffer():
-            yield completion
+        # async def accumulate_chunks():
+        #     nonlocal done
+        #     for chunk in request:
+        #         if chunk.choices[0].delta.content is not None:
+        #             buffer.append(chunk.choices[0].delta.content)
+        #     done = True
+
+        # loop.create_task(accumulate_chunks())
+        # async for completion in yield_buffer():
+        #     yield completion
 
 
 # Load the model

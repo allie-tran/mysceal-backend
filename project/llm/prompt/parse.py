@@ -46,6 +46,24 @@ Answer in this format:
 ```
 """
 
+
+QUESTION_CLASSIFICATION = """
+I need to classify the following question into a category. The question can be classified into one of the following categories:
+- frequency: questions that ask about the frequency of an event, like "how often", "how many times", "how frequently"
+- time: questions that ask about the time of an event, like "when", "what time", "how long", "how much time", "what date", "what month", "how long"
+- location: questions that ask about the location of an event, like "where", "what place", "what location", "what area", "what city", "what country", "which country", "which city", "which area", "name of the place", "name of the location", "name of the area", "name of the city", "name of the country"
+- visual: questions that ask about the visual information of an event, like "what does it look like", "what do I see", "what is in the image"
+
+Provide the category for the following question:
+Question: {question}
+Response:
+```json
+{{
+    "category": "category" (frequency, time, location, visual)
+}}
+```
+"""
+
 SIMPLE_EXAMPLES = """
 Query: "I was biking in the park near my house in the early morning."
 Response:
@@ -183,4 +201,30 @@ Example 3: "I had a long walk in the park in the morning because I stayed out la
 
 These are rational guesses. Now, provide the before and after information for the following query:
 Query: {query}
+"""
+
+PARSE_NEGATION = """
+I need to find the relevant information from the lifelog retrieval system based on the negation information. The system will retrieve the information based on the negation information. The system will consider the negation information as the query and the relevant information as the answer.
+
+For the text, please elaborate on the information so that the system can find the relevant information.
+
+If there is any information that should be excluded from the search, provide the negation information to be used in a "$nor" query in MongoDB or "must_not" in Elasticsearch. The negation information should be as specific as possible. If there is no negation information, just leave it empty.
+
+Example 1: "I was in the park at the weekend, but I didn't see any dogs."
+text: "I was in the park on Saturday and Sunday"
+must_not: "seeing any dogs"
+
+Example 2: "I visited the museum outside of Ireland when it was dark."
+text: "I visited the museum in the evening"
+must_not: "in Ireland"
+
+Query: {query}
+
+Response:
+```json
+{{
+    "text": "A statement that is a search query",
+    "must_not": "A statement that should be excluded from the search"
+}}
+```
 """

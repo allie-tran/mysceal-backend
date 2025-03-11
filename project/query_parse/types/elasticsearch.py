@@ -117,6 +117,13 @@ class ESGeoDistance(ESQuery):
         }
 
     def to_mongo(self):
+        return None
+        distance = 0.2
+        if "km" in self.distance:
+            distance = float(self.distance.replace("km", "").strip())
+        elif "m" in self.distance:
+            distance = float(self.distance.replace("m", "").strip()) / 1000
+        distance = distance / 111.12
         return {
             "gps": {
                 "$near": {
@@ -124,7 +131,7 @@ class ESGeoDistance(ESQuery):
                         "type": "Point",
                         "coordinates": [self.lon, self.lat],
                     },
-                    "$maxDistance": self.distance,
+                    "$maxDistance": distance,
                 }
             }
         }
@@ -214,6 +221,26 @@ class ESMatch(ESQuery):
 
     def __bool__(self):
         return bool(self.query)
+
+
+class ESNot(ESQuery):
+    """
+    A class to represent a not query in Elasticsearch
+    """
+
+    query: ESQuery
+
+    def to_query(self) -> dict:
+        assert self.query is not None
+        return {"bool": {"must_not": self.query.to_query()}}
+
+    def __bool__(self):
+        return bool(self.query)
+
+    def to_mongo(self):
+        query = self.query.to_mongo()
+        if query:
+            return {"$nor": [query]}
 
 
 class ESFuzzyMatch(ESMatch):
@@ -397,7 +424,17 @@ class ESFilter(ESQuery):
     def to_mongo(self):
         if isinstance(self.value, list):
             return {self.field: {"$in": self.value}}
-        return {self.field: self.value}  # TODO!
+
+        return {
+            "$or": [
+                {self.field: {"$regex": f"^{self.value}$", "$options": "i"}},
+                {
+                    self.field: {
+                        "$elemMatch": {"$regex": f"^{self.value}$", "$options": "i"}
+                    }
+                },
+            ]
+        }
 
     def __bool__(self):
         return self.value is not None
@@ -504,7 +541,11 @@ class ESOrFilters(ESListQuery):
             return None
         if len(valid_queries) == 1:
             return valid_queries[0].to_mongo()
-        return {"$or": [query.to_mongo() for query in valid_queries]}
+        queries = [query.to_mongo() for query in valid_queries]
+        queries = [query for query in queries if query]
+        if len(queries) == 1:
+            return queries[0]
+        return {"$or": queries}
 
 
 class ESAndFilters(ESListQuery):
@@ -520,7 +561,31 @@ class ESAndFilters(ESListQuery):
             return None
         if len(valid_queries) == 1:
             return valid_queries[0].to_mongo()
-        return {"$and": [query.to_mongo() for query in valid_queries]}
+        queries = [query.to_mongo() for query in valid_queries]
+        queries = [query for query in queries if query]
+        if len(queries) == 1:
+            return queries[0]
+        return {"$and": queries}
+
+
+class ESNotFilters(ESListQuery):
+    """
+    A class to represent a list of NOT filters in Elasticsearch
+    """
+
+    logical_operator: str = "not"
+
+    def to_mongo(self) -> Optional[Union[Dict, List[Dict]]]:
+        valid_queries = [query for query in self.queries if query]
+        if not valid_queries:
+            return None
+        if len(valid_queries) == 1:
+            return valid_queries[0].to_mongo()
+        queries = [query.to_mongo() for query in valid_queries]
+        queries = [query for query in queries if query]
+        if len(queries) == 1:
+            return queries[0]
+        return {"$nor": queries}
 
 
 class ESEmbedding(ESQuery):
@@ -528,6 +593,7 @@ class ESEmbedding(ESQuery):
     A class to represent an embedding in Elasticsearch
     """
 
+    text: str
     embedding: Optional[List[float]] = None
     field: Optional[str] = "clip_vector"
     model: Optional[str] = "exact"
@@ -550,6 +616,11 @@ class ESEmbedding(ESQuery):
     def __bool__(self):
         return self.embedding is not None
 
+    def to_mongo(self):
+        if self.text:
+            # a text search for caption
+            return {"$text": {"$search": self.text}}
+
 
 ESCombineFilters = Union[
     ESOrFilters,
@@ -563,13 +634,14 @@ ESCombineFilters = Union[
 
 
 # For LSC24, exclude the year 2015, 2016 and 2018
-MUST_NOT = ESAndFilters(
-    queries=[
-        ESFilter(field="year", value=2015),
-        ESFilter(field="year", value=2016),
-        ESFilter(field="year", value=2018),
-    ]
-)
+# MUST_NOT = ESAndFilters(
+#     queries=[
+#         ESFilter(field="year", value=2015),
+#         ESFilter(field="year", value=2016),
+#         ESFilter(field="year", value=2018),
+#     ]
+# )
+MUST_NOT = ESAndFilters(queries=[])
 
 
 class MongoQuery(BaseModel):
@@ -608,7 +680,7 @@ class ESBoolQuery(ESQuery):
     filters: EatingFilters | None = None
     # These are defined after processing the query
     must: ESAndFilters = ESAndFilters()
-    must_not: ESAndFilters = MUST_NOT
+    must_not: ESNotFilters = ESNotFilters()
     filter: ESAndFilters = ESAndFilters()
     should: ESOrFilters = ESOrFilters()
 
@@ -653,15 +725,22 @@ class ESBoolQuery(ESQuery):
     def __bool__(self):
         return bool(self.must or self.must_not or self.filter or self.should)
 
-    def to_mongo(self):
-        # Only use filter for now
-        filters = self.filter.to_mongo()
+    @staticmethod
+    def to_single_mongo(query: ESListQuery, operator="$or") -> Dict:
+        filters = query.to_mongo()
         if filters:
             if isinstance(filters, dict):
-                return filters
-            return {"$and": filters}
-        else:
-            return {}
+                return {operator: [filters]}
+            else:
+                return {operator: filters}
+        return {}
+
+    def to_mongo(self):
+        return {
+            "scores": self.to_single_mongo(self.should, "$or"),
+            "filters": self.to_single_mongo(self.filter, "$and"),
+            "must_not": self.to_single_mongo(self.must_not, "$nor"),
+        }
 
 
 class MSearchQuery(BaseModel):

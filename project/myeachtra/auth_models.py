@@ -57,23 +57,28 @@ def create_users() -> None:
         password=os.getenv("ADMIN_PASSWORD", ""),
         data_access=[Data.LSC23, Data.Deakin],
     )
-    lsc181 = CreateUserRequest(
-        username=os.getenv("LSC_USERNAME", ""),
-        password=os.getenv("LSC_PASSWORD", ""),
+    # lsc181 = CreateUserRequest(
+    #     username=os.getenv("LSC_USERNAME", ""),
+    #     password=os.getenv("LSC_PASSWORD", ""),
+    #     data_access=[Data.LSC23],
+    # )
+    # tiens = CreateUserRequest(
+    #     username=os.getenv("TIENS_USERNAME", ""),
+    #     password=os.getenv("TIENS_PASSWORD", ""),
+    #     data_access=[Data.LSC23],
+    # )
+    charlies = CreateUserRequest(
+        username="charlie",
+        password="lifelogvr",
         data_access=[Data.LSC23],
     )
-    tiens = CreateUserRequest(
-        username=os.getenv("TIENS_USERNAME", ""),
-        password=os.getenv("TIENS_PASSWORD", ""),
-        data_access=[Data.LSC23],
-    )
-    create_user(admin, overwrite=True)
-    create_user(lsc181)
-    create_user(tiens)
+    # create_user(admin, overwrite=True)
+    # create_user(lsc181)
+    # create_user(tiens)
+    create_user(charlies)
 
 
 # create_users()
-
 
 def generate_token(username: str) -> str:
     """

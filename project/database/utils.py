@@ -3,17 +3,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from configs import ESSENTIAL_FIELDS, IMAGE_ESSENTIAL_FIELDS
 from geopy.geocoders import Nominatim
-from llm import gpt_llm_model
+from llm import llm_model
 from llm.prompt.organize import RELEVANT_FIELDS_PROMPT
 from myeachtra.dependencies import memory
 from pydantic import ValidationError
 from pydantic.alias_generators import to_camel
 from query_parse.types.elasticsearch import GPS
-from query_parse.types.requests import Data, MapRequest
+from query_parse.types.requests import ChoicesResponse, Data, MapRequest
 from query_parse.utils import extend_no_duplicates
 from results.models import AsyncioTaskResult, Event, Icon, Image, Marker
 from results.utils import RelevantFields
-from retrieval.async_utils import async_timer, timer
+from retrieval.async_utils import async_timer
 from rich import print as rprint
 
 import requests
@@ -29,6 +29,8 @@ def to_event(data: Data, image: dict) -> Event:
     if "start_time" in image:
         return Event(**image)
     try:
+        if data == Data.Deakin:
+            image["time"] = image["snap"]["local_time"]
         image["start_time"] = image.pop("time")
         image["end_time"] = image["start_time"]
         image["images"] = [
@@ -57,7 +59,6 @@ def to_event(data: Data, image: dict) -> Event:
         raise e
 
 
-@timer("convert_to_events")
 def convert_to_events(
     key_list: List[str],
     relevant_fields: Optional[List[str]] = None,
@@ -125,7 +126,6 @@ def segments_to_events(
     for start, end in segments:
         images.extend(photo_ids[start:end])
     documents = []
-    print(data, images[:5])
 
     if relevant_fields:
         projection = extend_no_duplicates(relevant_fields, IMAGE_ESSENTIAL_FIELDS)
@@ -158,6 +158,15 @@ def segments_to_events(
 
     return events
 
+def get_event_from_images(images: List[str], data: Data) -> Event:
+    db = get_db(data)
+    documents = image_collection(db).find({"image": {"$in": images}})
+    docs = [to_event(data, doc) for doc in documents]
+    if len(docs) == 1:
+        return docs[0]
+    event = docs[0]
+    event.merge_with_many(1, docs[1:], [1] * len(docs[1:]))
+    return event
 
 def calculate_markers(event: Event) -> Tuple[List[Marker], List[GPS]]:
     """
@@ -185,7 +194,7 @@ async def get_relevant_fields(query: str, tag: str) -> AsyncioTaskResult:
     data = {}
     while True:
         try:
-            data = await gpt_llm_model.generate_from_text(prompt)
+            data = await llm_model.generate_from_text(prompt)
             if data:
                 rprint("Relevant Fields", data)
                 break
@@ -520,3 +529,19 @@ def get_unique_values(data: Data, field: str, condition: Optional[dict[str, Any]
     else:
         values = image_collection(db).distinct(field)
     return values
+
+def get_unique_patient_ids():
+    db = get_db(Data.Deakin)
+    # get all unique patientIds along with number of dates
+    values = image_collection(db).aggregate(
+        [
+            {"$group": {"_id": "$patient.id", "dates": {"$addToSet": "$date"}}},
+            {"$project": {"patientId": "$_id", "dates": {"$size": "$dates"}}},
+        ]
+    )
+    values = list(values)
+    choices = [value["patientId"] for value in values]
+    annotations = [f"{value['patientId']} ({value['dates']} dates)" for value in values]
+    return ChoicesResponse(choices=choices, annotations=annotations)
+
+

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from collections.abc import Sequence
@@ -19,7 +20,7 @@ from pyrate_limiter import BucketFullException, Duration, Limiter, Rate
 from rich import print
 
 from llm.prompts import INSTRUCTIONS
-from retrieval.async_utils import async_generator_timer, async_timer
+from retrieval.async_utils import async_generator_timer
 
 parser = JSONParser()
 parser.on_extra_token = lambda *_, **__: None
@@ -52,11 +53,11 @@ class LLM:
         Generate completions from a list of messages
         """
         request = await self.client.chat.completions.create(
-            model=self.model_name, messages=messages, stream=True,
-            temperature=0.2
+            model=self.model_name, messages=messages, stream=True
         )
 
         async for chunk in request:
+            await asyncio.sleep(0)
             if chunk.choices[0].delta.content is not None:
                 yield chunk.choices[0].delta.content
 
@@ -92,6 +93,7 @@ class LLM:
         async for completion in self.generate(messages):
             res += completion
             response = res
+            await asyncio.sleep(0)
 
             if DEBUG:
                 print(completion, end="")
@@ -123,7 +125,6 @@ class LLM:
 
         yield all_objects
 
-    @async_timer("generate_from_text")
     async def generate_from_text(self, text: str) -> Optional[Dict]:
         """
         Generate completions from text
@@ -134,10 +135,10 @@ class LLM:
         messages.append(ChatCompletionUserMessageParam(role="user", content=text))
         res = None
         async for data in self.__generate_and_parse(messages):
+            await asyncio.sleep(0)
             res = data
         return res
 
-    @async_generator_timer("stream_from_text")
     async def stream_from_text(self, text: str) -> AsyncGenerator[Dict, None]:
         """
         Generate completions from text
@@ -166,8 +167,8 @@ class LLM:
                 )
         messages.append(ChatCompletionUserMessageParam(role="user", content=content))
         async for completion in self.__generate_and_parse(messages):
-            if DEBUG:
-                print("GPT", completion)
+            # if DEBUG:
+            print("GPT", completion)
             yield completion
 
 

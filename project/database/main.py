@@ -19,7 +19,7 @@ def create_text_index(db, collection_name):
     db[collection_name].create_index([("captions", "text")])
 
 try:
-    create_text_index(LSC_DB, "images")
+    # create_text_index(LSC_DB, "images")
     create_text_index(DEAKIN_DB, "images")
 except Exception as e:
     print(e)

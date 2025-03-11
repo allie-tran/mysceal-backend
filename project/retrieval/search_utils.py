@@ -11,7 +11,7 @@ from elastic_transport import ObjectApiResponse
 from fastapi import HTTPException
 from query_parse.types.elasticsearch import ESBoolQuery, ESSearchRequest, MSearchQuery
 from query_parse.types.lifelog import Mode, TimeCondition
-from query_parse.types.requests import GeneralQueryRequest, Task
+from query_parse.types.requests import Data, GeneralQueryRequest, Task
 from requests import Response
 from results.models import (
     AsyncioTaskResult,
@@ -81,7 +81,6 @@ async def send_search_request(query: ESSearchRequest) -> ESResponse:
     """
     json_query = query.to_query()
     # Use normal search
-    print(f"{ES_URL}/{query.index}/_search")
     response = requests.post(
         f"{ES_URL}/{query.index}/_search{'?scroll=5m' if query.scroll else ''}",
         data=json.dumps(json_query),
@@ -113,6 +112,7 @@ async def send_search_request(query: ESSearchRequest) -> ESResponse:
 
 
 async def send_multiple_search_request(
+    data: Data,
     queries: MSearchQuery,
 ) -> Sequence[Optional[EventResults]]:
 
@@ -138,7 +138,7 @@ async def send_multiple_search_request(
                 events=convert_to_events(event_ids),
                 scores=[d["_score"] for d in res["hits"]["hits"]],
             )
-            events = create_event_label(events)
+            events = create_event_label(data, events)
             list_events.append(events)
         except KeyError:
             print("KeyError", res)
@@ -208,7 +208,9 @@ async def get_raw_search_results(
     )
 
 
-async def get_search_results(request: ESSearchRequest) -> EventResults | None:
+async def get_search_results(
+    data: Data, request: ESSearchRequest
+) -> EventResults | None:
     es_response = await send_search_request(request)
     results = process_es_results(request.query, es_response, request.test, request.mode)
 
@@ -218,7 +220,7 @@ async def get_search_results(request: ESSearchRequest) -> EventResults | None:
 
     print(f"[green]Found {len(results)} events[/green]")
     # Give some label to the results
-    results = create_event_label(results)
+    results = create_event_label(data, results)
 
     # Just send the raw results first (unmerged, with full info)
     return results
@@ -332,7 +334,6 @@ def merge_msearch_with_main_results(
     return DoubletEventResults(events=doublets, scores=doublet_scores)
 
 
-@timer("organize_by_relevant_fields")
 def organize_by_relevant_fields(results, relevant_fields) -> EventResults:
     print(f"[green]Organizing by relevant fields: {relevant_fields}[/green]")
     images = [image.src for event in results.events for image in event.images]
@@ -345,7 +346,6 @@ def organize_by_relevant_fields(results, relevant_fields) -> EventResults:
     return results
 
 
-@timer("process_search_results")
 def process_search_results(results: GenericEventResults) -> List[TripletEvent]:
     # This is the search results
     if not results:
@@ -368,7 +368,6 @@ def process_search_results(results: GenericEventResults) -> List[TripletEvent]:
     return triplet_results
 
 
-@async_generator_timer("get_search_function")
 def get_search_function(
     request: GeneralQueryRequest,
     single_query: Callable,

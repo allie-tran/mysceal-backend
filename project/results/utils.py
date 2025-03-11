@@ -296,18 +296,10 @@ def merge_events(
     if RERANK:
         threshold = 0.5
         # Get the best image for each event
-        encoded_query = encode_text(text, get_model(data))
         events = new_results
 
-        images = [img for event in events for img in event.images]
-        image_scores = score_images(images, encoded_query, get_model(data))
-        image_to_scores = {img.src: score for img, score in zip(images, image_scores)}
-        best_images = [
-            max(event.images, key=lambda img: image_to_scores[img.src]).src
-            for event in events
-        ]
         # print([(best_image, event.images) for best_image, event in zip(best_images, events)])
-        reranker_scores = reranker.rerank(text, best_images)
+        reranker_scores = reranker.rerank_scenes(text, events)
 
         # remove events with score < 0.5
         events = [
@@ -426,7 +418,6 @@ def merge_scenes_and_images(scenes: EventResults, images: EventResults) -> Event
     )
 
 
-@timer("limit_images_per_event")
 def limit_images_per_event(
     results: GenericEventResults,
     text_query: str,
@@ -481,12 +472,16 @@ def basic_label(event: Event) -> str:
     """
     start_time = event.start_time.strftime("%H:%M")
     end_time = event.end_time.strftime("%H:%M")
+    if start_time == end_time:
+        time = start_time
+    else:
+        time = f"{start_time} - {end_time}"
     if event.data == Data.LSC23:
         location = event.location
     else:
         location = event.user_id
     date = event.start_time.strftime("%d, %b %Y")
-    return f"<strong>{location}</strong>\n{date}, {start_time} - {end_time}"
+    return f"<strong>{location}</strong>\n{date}, {time}"
 
 
 def create_event_label(

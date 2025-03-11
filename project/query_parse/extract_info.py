@@ -1,10 +1,11 @@
 from collections import defaultdict
-from typing import Optional, Self, Sequence
+from typing import Dict, Optional, Self, Sequence
 
 from database.main import es_collection, get_db
 from myeachtra.dependencies import ObjectId
 from openai import BaseModel
 from pydantic import SkipValidation, model_validator
+from retrieval.async_utils import async_generator_timer, async_timer
 from retrieval.search_utils import send_search_request
 
 from query_parse.es_utils import (
@@ -21,6 +22,8 @@ from query_parse.types.elasticsearch import (
     ESCombineFilters,
     ESEmbedding,
     ESFilter,
+    ESNot,
+    ESNotFilters,
     ESSearchRequest,
     LocationInfo,
     TimeInfo,
@@ -182,6 +185,7 @@ def time_to_filters(
 ) -> Sequence[ESCombineFilters]:
     if not query.temporal_queries or overwrite:
         query.temporal_queries, _ = get_temporal_filters(query.time, mode)
+        print(query.temporal_queries)
     return query.temporal_queries
 
 
@@ -315,6 +319,26 @@ async def create_es_query(
         query.es = es
     return query.es
 
+async def create_must_not_query(
+    query: Query,
+) -> ESNotFilters:
+    # Get the filters
+    time, date, timestamp, _, weekday = time_to_filters(query)
+    place, _, region = location_to_filters(query)
+    embedding, ocr, concepts = text_to_visual(query)
+
+    filters = ESNotFilters()
+
+    # Filter queries (no scores)
+    filters.append(time)
+    filters.append(date)
+    filters.append(timestamp)
+    filters.append(region)
+    filters.append(weekday)
+
+    return filters
+
+
 
 async def create_es_combo_query(
     query: ComboQuery,
@@ -333,11 +357,14 @@ async def create_es_combo_query(
         es.filters = query.main.eating_filters
 
     if query.must_not:
-        query.must_not.es = await create_es_query(
-            query.must_not, ignore_limit_score, overwrite, mode
-        )
-        query.must_not.es.must_not = ESAndFilters()
-        es.must_not.append(query.must_not.es)
+        must_not = await create_must_not_query(query.must_not)
+        es.must_not = must_not
+        # es.should.append(ESNot(query=must_not["scores"]))
+        # query.must_not.es = await create_es_query(
+        #     query.must_not, ignore_limit_score, overwrite, mode
+        # )
+        # query.must_not.es.must_not = ESAndFilters()
+        # es.must_not.append(query.must_not.es)
 
     query.es = es
     query.mark_extracted(es)
