@@ -155,6 +155,7 @@ class Event(CamelCaseModel):
     icon: Optional[Icon] = Icon(type="material", name="place")
 
     count: int = 1
+    keyframes: List[Image] = []
 
     # # Extra
     # time: Optional[datetime] = None
@@ -458,6 +459,7 @@ class AnswerListResult(CamelCaseModel, revalidate_instances="always"):
 class TimelineScene(CamelCaseModel):
     scene: str
     images: List[Image]
+    keyframes: List[Image] = []
 
 class TimelineGroup(CamelCaseModel):
     """

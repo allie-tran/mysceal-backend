@@ -152,42 +152,6 @@ def is_black_listed(answer: str) -> bool:
             return True
     return False
 
-
-async def answer_visual_one_event(
-    n: int,
-    question: str,
-    textual_description: str,
-    event: Event,
-) -> AsyncGenerator[List[AnswerResult], None]:
-    """
-    Process the question for a single event
-    """
-    image_paths = event.images
-    if len(image_paths) == 0:
-        yield []
-        return
-
-    async for answer_list in answer_visual_with_text(
-        question, image_paths, textual_description
-    ):
-        for answer_dict in answer_list:
-            try:
-                answer: str = answer_dict["answer"]
-                explanation: str = answer_dict["explanation"]
-                if not is_black_listed(answer):
-                    yield [
-                        AnswerResult(
-                            text=answer,
-                            explanation=[explanation],
-                            evidence=[n + 1],
-                        )
-                    ]
-            except Exception as e:
-                rprint(e)
-                rprint("GPT", answer_dict)
-    yield []
-
-
 def to_base64(image_path: str) -> str:
     with open(image_path, "rb") as image_file:
         b64 = base64.b64encode(image_file.read()).decode("utf-8")

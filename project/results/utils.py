@@ -14,8 +14,8 @@ from database.main import get_db, image_collection, scene_collection
 from pydantic import BaseModel, InstanceOf, validate_call
 from query_parse.types.lifelog import MaxGap, RelevantFields
 from query_parse.types.requests import Data
-from query_parse.visual import encode_text, get_model, score_images
-from retrieval.async_utils import timer
+from query_parse.visual import get_model, score_images
+from retrieval.dynamic_segmentation import get_keyframes_from_segments
 from retrieval.rerank import reranker
 from rich import print
 
@@ -211,7 +211,6 @@ def merge_events(
     if not results.events:
         return results
 
-
     # Check if any of the groupby should be calculated
     available_fields = set(type(results.events[0]).model_fields)
     derive_fields = []
@@ -294,12 +293,17 @@ def merge_events(
     # ----------------------------- #
     # rerank
     if RERANK:
+        encoded_text = get_model(data).encode_text(text)
         threshold = 0.5
         # Get the best image for each event
         events = new_results
 
+        # get keyframes
+        for event in events:
+            event.keyframes = get_keyframes_from_segments(encoded_text, data, event.images)
+
         # print([(best_image, event.images) for best_image, event in zip(best_images, events)])
-        reranker_scores = reranker.rerank_scenes(text, events)
+        reranker_scores = reranker.rerank_scenes(data, text, events)
 
         # remove events with score < 0.5
         events = [
@@ -360,8 +364,8 @@ def merge_events(
 
     print("[green]Merged into[/green]", len(new_results), "events")
     return EventResults(
-        events=new_results,
-        scores=new_scores,
+        events=new_results,  # type: ignore
+        scores=new_scores,  # type: ignore
         relevant_fields=results.relevant_fields + derive_fields,
         min_score=results.min_score,
         max_score=results.max_score,
@@ -390,7 +394,7 @@ def merge_scenes_and_images(scenes: EventResults, images: EventResults) -> Event
         scene_images = scene.images
         scene_scores = scene.image_scores
         if scene_images:
-            scene.images, scene.image_scores = zip(
+            scene.images, scene.image_scores = zip(  # type: ignore
                 *sorted(
                     zip(scene_images, scene_scores),
                     key=lambda x: x[1],
@@ -429,11 +433,11 @@ def limit_images_per_event(
     This is achieved by selecting the images with the highest score
     and highest relevance to the query
     """
-    encoded_query = encode_text(text_query)
+    encoded_query = get_model(data).encode_text(text_query)
     for generic_event in results.events:
         for event in generic_event.custom_iter():  # might be a doublet or triplet
-
             images: List[Image] = event.images
+            keyframes = get_keyframes_from_segments(encoded_query, data, event.images)
             scores = event.image_scores
 
             if len(images) <= max_images:
@@ -462,6 +466,7 @@ def limit_images_per_event(
             assert len(images) > 0, "No images"
             event.images = new_images
             event.image_scores = new_scores
+            event.keyframes = keyframes
 
     return results
 
@@ -485,8 +490,7 @@ def basic_label(event: Event) -> str:
 
 
 def create_event_label(
-    data: Data,
-    results: GenericEventResults, relevant_fields: List[str] = []
+    data: Data, results: GenericEventResults, relevant_fields: List[str] = []
 ) -> GenericEventResults:
     """
     Create a label for the event

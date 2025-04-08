@@ -3,7 +3,6 @@
 
 import pandas as pd
 from pymongo import MongoClient
-from tqdm.auto import tqdm
 
 client = MongoClient("localhost", 27017)
 db = client["LSC24_new"]

@@ -1,48 +1,90 @@
 import time
 from collections.abc import Set
-from typing import Optional
+from typing import List, Optional, TypeVar
 
 import numpy as np
-import pandas as pd
-from configs import CLIP_EMBEDDINGS
 from database.main import get_db, image_collection
 from query_parse.types.requests import Data
-from query_parse.visual import clip_model, clipa_model, get_model, photo_ids
-from tqdm.auto import tqdm
-
+from query_parse.visual import clip_model, clipa_model, get_model, photo_ids, blurred_indices
+from results.models import Image
 from retrieval.async_utils import timer
 from retrieval.rerank import reranker
+from sklearn.cluster import DBSCAN
+from tqdm.auto import tqdm
 
+I = TypeVar("I", Image, str)
 
-def get_blurred_indices(data: Data):
-    blurred_df = pd.read_csv(f"{CLIP_EMBEDDINGS}/{data}/blurred.csv")
-    blurred_df["laplacian_var"] = blurred_df["laplacian_var"].fillna(0)
-    blurred_images = blurred_df[blurred_df["laplacian_var"] < 10]["image"].tolist()
-    blurred_images = set(blurred_images)
-    blurred_indices = [
-        i for i, image in enumerate(photo_ids(data)) if image in blurred_images
-    ]
-    return set(blurred_indices)
+def get_keyframes_from_segments(encoded_query: np.ndarray | None, data: Data, images: List[I]) -> List[I]:
+    # for each segment, use dbscan to cluster the images
+    # for each cluster, get the average score
+    # for each cluster, get the image with the closest score to the average score and the highest to others average scores
+    # return the list of images
+    model = get_model(data)
+    photo_ids = model.photo_ids[data]
+    features = model.norm_photo_features[data]
+    low_density_indices = blurred_indices[data]
 
-def get_low_visual_density_indices(data: Data):
-    low_density_df = pd.read_csv(f"{CLIP_EMBEDDINGS}/{data}/visual_density.csv")
-    low_density_images = low_density_df[low_density_df["score"] < 5]["image"].tolist()
-    low_density_images = set(low_density_images)
-    low_density_indices = [
-        i for i, image in enumerate(photo_ids(data)) if image in low_density_images
-    ]
-    return set(low_density_indices)
+    if len(images) < 4:
+        return images
 
+    image_src_to_image: dict[str, I] = {}
+    image_srcs: list[str] = []
+    for image in images:
+        if isinstance(image, Image):
+            image_src_to_image[image.src] = image
+            image_srcs.append(image.src)
+        else:
+            image_src_to_image[image] = image
+            image_srcs.append(image)
 
-blurred_indices = {
-    Data.LSC23: get_low_visual_density_indices(Data.LSC23),
-    Data.Deakin: get_low_visual_density_indices(Data.Deakin),
-}
+    image_set = set(image_srcs)
 
-clear_indices = {
-    Data.LSC23: set(range(len(photo_ids(Data.LSC23)))) - blurred_indices[Data.LSC23],
-    Data.Deakin: set(range(len(photo_ids(Data.Deakin)))) - blurred_indices[Data.Deakin],
-}
+    # Get the segment images that are not in the low density indices
+    segment_ids = [i for i, image in enumerate(photo_ids) if image in image_set]
+    segment_ids = [i for i in segment_ids if i not in low_density_indices]
+    good_images = [image_src_to_image[photo_ids[i]] for i in segment_ids]
+
+    if len(good_images) < 4:
+        return good_images
+
+    segment_features = features[np.array(segment_ids)]
+
+    # cluster the images
+    dbscan = DBSCAN(eps=0.03, min_samples=2, metric="cosine")
+    clusters = dbscan.fit_predict(segment_features)
+
+    chunk = []
+    for cluster in set(clusters):
+        cluster_images = [
+            image for i, image in enumerate(good_images) if clusters[i] == cluster
+        ]
+        cluster_set = set()
+        for image in cluster_images:
+            if isinstance(image, Image):
+                cluster_set.add(image.src)
+            else:
+                cluster_set.add(image)
+
+        if len(cluster_images) == 1:
+            chunk.append(cluster_images[0])
+        else:
+            cluster_ids = [
+                i for i, image in enumerate(photo_ids) if image in cluster_set
+            ]
+            cluster_features = features[np.array(cluster_ids)]
+            cluster_feat = np.mean(cluster_features, axis=0)
+            cluster_feat = cluster_feat / np.linalg.norm(cluster_feat)
+
+            distinct_scores = cluster_features @ cluster_feat.T
+            if encoded_query is not None:
+                image_scores = cluster_features @ encoded_query.T
+                distinct_scores += image_scores
+            closest_image = cluster_images[np.argmax(distinct_scores)]
+            chunk.append(closest_image)
+
+    # sort the images by the order they appear in the segment
+    chunk = sorted(chunk, key=lambda x: image_srcs.index(x if isinstance(x, str) else x.src))
+    return chunk
 
 
 def detect_noise(scores1, scores2, method="absolute", threshold=None, percentile=95):
@@ -190,16 +232,14 @@ FIXED_BOUNDARIES = {
 def get_segments(
     query: str,
     data: Data = Data.LSC23,
-    score_percentile: int = 98,
+    score_percentile: int = 99,
     variance_percentile: int = 75,
     max_gap: int = 5,
     max_length: int = 100,
     filters: Optional[Set[str]] = None,
     to_merge: bool = False,
-    size: int | None = None,
     metadata_scores: dict = {},
 ):
-    print("Query", query)
     good_indices, scores, score_threshold, get_group_score = get_scores(
         data, query, filters, score_percentile, metadata_scores
     )
@@ -394,7 +434,9 @@ def get_scores(data: Data, query: str, filters: Optional[Set[str]], score_percen
 
     # Add metadata scores
     np_metadata_scores = np.array([metadata_scores.get(photo_id, 0) for photo_id in photo_ids])
-    metadata_scores = np_metadata_scores / np.max(np_metadata_scores)
+    max_metadata_score = np.max(np_metadata_scores)
+    if max_metadata_score > 0:
+        metadata_scores = np_metadata_scores / max_metadata_score
 
     scores = (
         np.array(scores) * lambda1 + np.array(alt_scores) * lambda2 # + np_metadata_scores * 0.1
@@ -488,7 +530,7 @@ def get_segments_2(
     filtered_indices = [i for i, image in enumerate(photo_ids) if image in filters]
     filtered_features = features[np.array(filtered_indices)]
 
-    all_scores, _ = chosen_model.score_all_images(query, data)
+    all_scores, encoded_query = chosen_model.score_all_images(query, data)
     alt_scores, _ = alternative_model.score_all_images(query, data)
 
     all_scores = np.array(all_scores)
@@ -504,7 +546,7 @@ def get_segments_2(
     # lower threshold means bigger segments
     threshold = np.percentile(all_sims, 90)
     # lower score threshold means more segments
-    score_threshold = np.percentile(all_scores, 98)
+    score_threshold = np.percentile(all_scores, 97)
     lower_score_threshold = np.percentile(all_scores, 70)
     print("Threshold", threshold)
     print("Score Threshold", score_threshold)
@@ -520,7 +562,7 @@ def get_segments_2(
     end = 1
     while end < len(filtered_indices) and start < len(filtered_indices):
         # try to see if the next image is similar
-        if all_sims[end - 1] < threshold and end - start > 5:
+        if all_sims[end - 1] < threshold and end - start > 3 and end not in blurred:
             segments.append((filtered_indices[start], filtered_indices[end] + 1))
             start = end + 1
             end = start + 1
@@ -540,17 +582,6 @@ def get_segments_2(
         all_indices - all_used_indices
     )
 
-    checking_image="ID137/2022/06/27/ID137_20220627_173512_000.jpg"
-    print("Checking", checking_image)
-    for i, (start, end) in enumerate(segments):
-        if checking_image in photo_ids[start:end]:
-            print("Found in segment", i)
-            print("Segment scores", all_scores[start:end])
-            break
-
-    print("Number of segments", len(segments))
-    print("Segment Lengths", [end - start for start, end in segments])
-
     # rerank segments
     results = []
     scores = []
@@ -558,22 +589,17 @@ def get_segments_2(
     print("Reranking segments")
     for start, end in tqdm(segments):
         images = [f"Deakin/{photo_ids[i]}" for i in range(start, end)]
-        if len(images) > 8:
-            # get the top 16 images
-            image_scores = all_scores[start:end]
-            image_indices = np.argsort(image_scores)[::-1][:8]
-            images = [images[i] for i in image_indices]
 
         # mean_score = np.mean(features[start:end] @ encoded_query.T)
         max_score = max(all_scores[start:end])
-
         results += [(start, end)]
         okay = False
         score = max_score
         if max_score > score_threshold:
             okay = True
         elif max_score > lower_score_threshold:
-            score = reranker.score(query, images)
+            keyframes = get_keyframes_from_segments(encoded_query, data, images)
+            score = reranker.score(data, query, keyframes)
             if score > 0.5:
                 print("Reranked", score)
                 okay = True

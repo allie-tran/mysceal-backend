@@ -185,7 +185,6 @@ def time_to_filters(
 ) -> Sequence[ESCombineFilters]:
     if not query.temporal_queries or overwrite:
         query.temporal_queries, _ = get_temporal_filters(query.time, mode)
-        print(query.temporal_queries)
     return query.temporal_queries
 
 

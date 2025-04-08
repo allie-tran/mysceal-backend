@@ -70,6 +70,7 @@ def get_scene_for_group_ids(
                     "group": {"$first": "$group"},
                     "scenes": {"$push": "$scene"},
                     "images": {"$push": "$images"},
+                    "keyframes": {"$push": "$keyframes"},
                     "time_info": {"$push": "$time_info"},
                     "location": {"$first": "$location"},
                     "location_info": {"$first": "$location_info"},
@@ -83,9 +84,10 @@ def get_scene_for_group_ids(
     for group in grouped_results:
         scenes: List[TimelineScene] = []
 
-        for scene, images in zip(group["scenes"], group["images"]):
+        for scene, images, keyframes in zip(group["scenes"], group["images"], group["keyframes"]):
             images = [Image.model_validate(image) for image in images]
-            scenes.append(TimelineScene(scene=scene, images=images))
+            keyframes = [Image.model_validate(keyframe) for keyframe in keyframes]
+            scenes.append(TimelineScene(scene=scene, images=images, keyframes=keyframes))
 
         group["scenes"] = scenes
         group_obj = TimelineGroup(**group)

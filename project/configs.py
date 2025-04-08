@@ -48,7 +48,7 @@ TIMEOUT = 60
 
 # Timeline Configurations
 TIMELINE_SPAN = 9  # If they want more, submit more
-RERANK = True
+RERANK = False
 
 # QA Configurations
 BUILD_ON_STARTUP = True
@@ -71,6 +71,7 @@ CLIP_EMBEDDINGS = os.environ.get("CLIP_EMBEDDINGS")
 DATA_YEARS = ["LSC23"]
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY")
 IMAGE_DIRECTORY = f"{CLIP_EMBEDDINGS}/Images"
+DATA_DIRECTORY = os.environ.get("DATA_DIRECTORY")
 # ====================== #
 # Elasticsearch Configurations #
 # ====================== #

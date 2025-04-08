@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 from configs import (
     CLIP_EMBEDDINGS,
+    DATA_DIRECTORY,
     DATA_YEARS,
     EMBEDDING_DIM,
     IMAGE_DIRECTORY,
@@ -17,7 +18,6 @@ from numpy import linalg as LA
 from open_clip.model import CLIP
 from open_clip.tokenizer import _tokenizer
 from PIL import Image as PILImage
-from results.models import Image
 from retrieval.async_utils import timer
 from rich import print
 from transformers import AutoModel, AutoProcessor
@@ -32,7 +32,6 @@ from .utils import search_keywords
 device = "cpu"
 if torch.cuda.is_available():  # type: ignore
     device = "cuda"
-
 
 def load_features(paths):
     # Load pre-embedded photo features
@@ -248,7 +247,6 @@ class SIGLIP(ClipModel):
         # Both datasets
         self.combine_datasets(lsc_paths, deakin_paths)
 
-    @timer("SIGLIP encode text")
     def encode_text(self, main_query: str) -> np.ndarray:
         sentences = _split_text(main_query, 77)
         inputs = self.processor(
@@ -261,13 +259,6 @@ class SIGLIP(ClipModel):
         with torch.no_grad():
             with torch.autocast(device):
                 outputs = self.model.get_text_features(**inputs).mean(dim=0)
-        return outputs.cpu().float().numpy()
-
-    def encode_image(self, image_path: str) -> np.ndarray:
-        image_read = PILImage.open(f"{IMAGE_DIRECTORY}/{image_path}")
-        photo_preprocessed = self.processor(images=image_read, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.model.get_image_features(**photo_preprocessed)
         return outputs.cpu().float().numpy()
 
 
@@ -343,5 +334,38 @@ def photo_ids(data: Data):
     chosen_model = get_model(data)
     return chosen_model.photo_ids[data]
 
+
+def get_duplicates(data: Data):
+    duplicates = []
+    if os.path.exists(f"{DATA_DIRECTORY}/{data}/duplicates.txt"):
+        with open(f"{DATA_DIRECTORY}/{data}/duplicates.txt") as f:
+            duplicates = f.readlines()
+        duplicates = [line.strip() for line in duplicates]
+        duplicates = set(duplicates)
+    return duplicates
+
+
+
+def get_low_visual_density_indices(data: Data):
+    low_density_df = pd.read_csv(f"{CLIP_EMBEDDINGS}/{data}/visual_density.csv")
+    low_density_images = low_density_df[low_density_df["score"] < 10]["image"].tolist()
+    low_density_images = set(low_density_images)
+
+    duplicates = get_duplicates(data)
+    low_density_indices = [
+        i for i, image in enumerate(photo_ids(data)) if image in low_density_images or image.split("/")[-1] in duplicates
+    ]
+    return set(low_density_indices)
+
+
+blurred_indices = {
+    Data.LSC23: get_low_visual_density_indices(Data.LSC23),
+    Data.Deakin: get_low_visual_density_indices(Data.Deakin),
+}
+
+clear_indices = {
+    Data.LSC23: set(range(len(photo_ids(Data.LSC23)))) - blurred_indices[Data.LSC23],
+    Data.Deakin: set(range(len(photo_ids(Data.Deakin)))) - blurred_indices[Data.Deakin],
+}
 
 print("visual.py loaded")

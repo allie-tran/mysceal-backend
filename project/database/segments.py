@@ -1,6 +1,4 @@
 from typing import List
-import numpy as np
-from sklearn.cluster import DBSCAN
 
 from llm import vllm_model
 from llm.models import MixedContent
@@ -12,7 +10,7 @@ from results.models import Image
 from rich import print as rprint
 
 from database.main import get_db
-from retrieval.dynamic_segmentation import get_low_visual_density_indices
+from retrieval.dynamic_segmentation import get_keyframes_from_segments
 
 
 # ====================== #
@@ -50,9 +48,10 @@ def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = 
         segments = merge_segments(segments)
 
     # update keyframes
+    encoded_query = get_model(data).encode_text("I am eating or interacting with food")
     for segment in segments.segments:
         if not segment.keyframes:
-            segment.keyframes = get_keyframes_from_segments(data, segment.images)
+            segment.keyframes = get_keyframes_from_segments(encoded_query, data, segment.images)
 
     upserted = db["segments"].update_one(
         {
@@ -105,59 +104,6 @@ def merge_segments(segments: EventSegments) -> EventSegments:
     segments.segments = merged_segments
     return segments
 
-def get_keyframes_from_segments(data: Data, images: List[Image]) -> List[Image]:
-    # for each segment, use dbscan to cluster the images
-    # for each cluster, get the average score
-    # for each cluster, get the image with the closest score to the average score and the highest to others average scores
-    # return the list of images
-    model = get_model(data)
-    photo_ids = model.photo_ids[data]
-    features = model.norm_photo_features[data]
-    encoded_query = model.encode_text("I am eating or interacting with food")
-    low_density_indices = get_low_visual_density_indices(data)
-
-    if len(images) < 4:
-        return images
-
-    image_src_to_image = {image.src: image for image in images}
-    image_srcs = [image.src for image in images]
-    image_set = set(image_srcs)
-
-    # Get the segment images that are not in the low density indices
-    segment_ids = [i for i, image in enumerate(photo_ids) if image in image_set]
-    segment_ids = [i for i in segment_ids if i not in low_density_indices]
-    good_images = [image_src_to_image[photo_ids[i]] for i in segment_ids]
-
-    if len(good_images) < 4:
-        return good_images
-
-    segment_features = features[np.array(segment_ids)]
-
-    # cluster the images
-    dbscan = DBSCAN(eps=0.03, min_samples=2, metric="cosine")
-    clusters = dbscan.fit_predict(segment_features)
-
-    chunk = []
-    for cluster in set(clusters):
-        cluster_images = [image for i, image in enumerate(good_images) if clusters[i] == cluster]
-        cluster_set = set([image.src for image in cluster_images])
-        if len(cluster_images) == 1:
-            chunk.append(cluster_images[0])
-        else:
-            cluster_ids = [i for i, image in enumerate(photo_ids) if image in cluster_set]
-            cluster_features = features[np.array(cluster_ids)]
-            cluster_feat = np.mean(cluster_features, axis=0)
-            cluster_feat = cluster_feat / np.linalg.norm(cluster_feat)
-
-            distinct_scores = cluster_features @ cluster_feat.T
-            image_scores = cluster_features @ encoded_query.T
-            image_scores = image_scores + distinct_scores
-            closest_image = cluster_images[np.argmax(image_scores)]
-            chunk.append(closest_image)
-
-    # sort the images by the order they appear in the segment
-    chunk = sorted(chunk, key=lambda x: image_srcs.index(x.src))
-    return chunk
 
 async def annotate_segments_vllm(
     segments: List[EventSegment], data: Data
@@ -230,7 +176,8 @@ Leave the annotation blank if it is not possible to determine the annotation fro
 """,
             )
         ]
-        images = get_keyframes_from_segments(data, segment.images)
+        encoded_query = get_model(data).encode_text("I am eating or interacting with food")
+        images = get_keyframes_from_segments(encoded_query, data, segment.images)
         # split the images into smaller chunks (max 9 images per chunk)
         max_images_per_chunk = 4
         for j in range(0, len(images), max_images_per_chunk):

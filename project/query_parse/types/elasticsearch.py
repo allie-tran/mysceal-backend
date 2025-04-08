@@ -424,7 +424,6 @@ class ESFilter(ESQuery):
     def to_mongo(self):
         if isinstance(self.value, list):
             return {self.field: {"$in": self.value}}
-
         return {
             "$or": [
                 {self.field: {"$regex": f"^{self.value}$", "$options": "i"}},
@@ -543,9 +542,10 @@ class ESOrFilters(ESListQuery):
             return valid_queries[0].to_mongo()
         queries = [query.to_mongo() for query in valid_queries]
         queries = [query for query in queries if query]
-        if len(queries) == 1:
-            return queries[0]
-        return {"$or": queries}
+        if queries:
+            if len(queries) == 1:
+                return queries[0]
+            return {"$or": queries}
 
 
 class ESAndFilters(ESListQuery):
@@ -563,9 +563,10 @@ class ESAndFilters(ESListQuery):
             return valid_queries[0].to_mongo()
         queries = [query.to_mongo() for query in valid_queries]
         queries = [query for query in queries if query]
-        if len(queries) == 1:
-            return queries[0]
-        return {"$and": queries}
+        if queries:
+            if len(queries) == 1:
+                return queries[0]
+            return {"$and": queries}
 
 
 class ESNotFilters(ESListQuery):

@@ -53,7 +53,6 @@ from query_parse.visual import (
     encode_text,
     get_model,
     photo_ids,
-    score_images,
 )
 from question_answering.text import answer_text_only, get_specific_description
 from question_answering.video import answer_visual_only, answer_visual_with_text
@@ -82,7 +81,7 @@ from results.utils import (
 from rich import print
 
 from retrieval.async_utils import async_generator_timer, async_timer
-from retrieval.dynamic_segmentation import get_segments, get_segments_2
+from retrieval.dynamic_segmentation import get_keyframes_from_segments, get_segments, get_segments_2
 from retrieval.graph_utils import get_deakin_heatmap_per_hours, get_heatmap_data
 from retrieval.search_utils import (
     get_raw_search_results,
@@ -201,25 +200,27 @@ async def simple_search(
             print("[green]Filtered images found[/green]", len(images))
 
         if mongo_query["scores"]:
-            find_query = {
-                **mongo_query["scores"],
-                **mongo_query["filters"],
-            }
-            print("[green]Score Mongo Query[/green]", find_query)
+            try:
+                find_query = {
+                    **mongo_query["scores"],
+                    **mongo_query["filters"],
+                }
+                print("[green]Score Mongo Query[/green]", find_query)
 
-            image_cursor = image_collection(db).find(
-                find_query, {"image": 1, "score": {"$meta": "textScore"}}
-            )
-            for doc in image_cursor:
-                mongo_scores[doc["image"]] = doc["score"]
-            print("[green]Images with scores found[/green]", len(mongo_scores))
+                image_cursor = image_collection(db).find(
+                    find_query, {"image": 1, "score": {"$meta": "textScore"}}
+                )
+                for doc in image_cursor:
+                    mongo_scores[doc["image"]] = doc["score"]
+                print("[green]Images with scores found[/green]", len(mongo_scores))
+            except Exception as e:
+                print("[red]Error in getting scores[/red]", e)
 
     segment_res = get_segments(
         main_query.query,
         data,
         max_gap=5,
         filters=images,
-        size=size,
         metadata_scores=mongo_scores,
     )
     if not segment_res["segments"]:
@@ -881,6 +882,8 @@ async def search_location_again(request: MapRequest) -> Optional[List[Event]]:
 
     query_doc["oid"] = query_doc.pop("_id")
     query = Query.model_validate(query_doc)
+    print("OLD Query", query)
+    print("-" * 50)
     location, center = request.location, request.center
     ids = []
     filters = []
@@ -895,11 +898,16 @@ async def search_location_again(request: MapRequest) -> Optional[List[Event]]:
         filters = [location_filters]
 
     if request.image:
-        location_filters = ids.append(ESFilter(field="images", value=request.image))
+        # get scene
+        image = request.image
+        doc = image_collection(get_db(request.data)).find_one({"image": image})
+        if doc:
+            scene = doc["scene"]
+            ids.append(ESFilter(name="SCENE", field="scene", value=scene))
     if request.scene:
-        location_filters = ids.append(ESFilter(field="scene", value=request.scene))
+        ids.append(ESFilter(name="SCENE", field="scene", value=request.scene))
     if request.group:
-        location_filters = ids.append(ESFilter(field="group", value=request.group))
+        ids.append(ESFilter(name="GROUP", field="group", value=request.group))
 
     # Modify the query
     new_query = await modify_es_query(
@@ -911,6 +919,7 @@ async def search_location_again(request: MapRequest) -> Optional[List[Event]]:
         overwrite=True,
     )
     if new_query:
+        print("New Query", new_query)
         results = await simple_search(
             new_query, size=20, data=request.data, tag="location"
         )
@@ -1099,13 +1108,15 @@ async def answer_single_event(
     if len(event.images) > 1:
         other_images = [x for x in event.images if x.src != image]
         encoded_query = encode_text(request.question, chosen_model=get_model(data))
-        visual_scores = score_images(
-            other_images, encoded_query, data, chosen_model=get_model(data)
-        )
-        sorted_images = sorted(
-            zip(other_images, visual_scores), key=lambda x: x[1], reverse=True
-        )
-        images = [this_image] + [x[0] for x in sorted_images[:8]]
+        # visual_scores = score_images(
+        #     other_images, encoded_query, data, chosen_model=get_model(data)
+        # )
+        # sorted_images = sorted(
+        #     zip(other_images, visual_scores), key=lambda x: x[1], reverse=True
+        # )
+        # images = [this_image] + [x[0] for x in sorted_images[:8]]
+        keyframes = get_keyframes_from_segments(encoded_query, data, other_images)
+        images = [this_image] + keyframes
     else:
         images = [this_image]
 

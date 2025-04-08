@@ -229,10 +229,7 @@ def get_collage_image(image_paths: List[str]):
 
 
 def get_openai_visual_message(image_paths: List[Image], data: Data = Data.LSC23) -> MixedContent | None:
-    if data == Data.Deakin:
-        images = [os.path.join(IMAGE_DIRECTORY, "Deakin", img.src) for img in image_paths]
-    else:
-        images = [os.path.join(IMAGE_DIRECTORY, img.src) for img in image_paths]
+    images = [os.path.join(IMAGE_DIRECTORY, data, img.src) for img in image_paths]
     collage = get_collage_image(images)
     if not collage:
         return None

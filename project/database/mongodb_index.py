@@ -65,7 +65,7 @@ for scene, info in json.load(open(info_path)).items():
     info["scene"] = scene
     aspect_ratios = []
     for image in info["images"]:
-        aspect_ratios.append(get_aspect_ratio(f"{IMAGE_DIRECTORY}/{image}"))
+        aspect_ratios.append(get_aspect_ratio(f"{IMAGE_DIRECTORY}/LSC23/{image}"))
     images = [
         {"src": image, "aspect_ratio": aspect_ratio}
         for image, aspect_ratio in zip(info["images"], aspect_ratios)
@@ -238,7 +238,7 @@ for image, info in json.load(open(info_path)).items():
 
     info["image"] = image
     del info["image_path"]
-    info["aspect_ratio"] = get_aspect_ratio(f"{IMAGE_DIRECTORY}/{image}")
+    info["aspect_ratio"] = get_aspect_ratio(f"{IMAGE_DIRECTORY}/LSC23/{image}")
     collection.insert_one(info)
 
 

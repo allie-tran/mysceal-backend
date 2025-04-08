@@ -21,5 +21,5 @@ def batch_encode(data: Data = Data.LSC23):
     for image in tqdm(image_collection(db).find(), total=size):
         image_path = image["image"]
         aspect_ratio = image["aspect_ratio"]
-        hash_code = encode_blurhash(f"{IMAGE_DIRECTORY}/{image_path}", aspect_ratio)
+        hash_code = encode_blurhash(f"{IMAGE_DIRECTORY}/{data}/{image_path}", aspect_ratio)
         image_collection(db).update_one({"_id": image["_id"]}, {"$set": {"hash_code": hash_code}})

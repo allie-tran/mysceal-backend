@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 from configs import QUERY_PARSER
-from llm import llm_model
+from llm import small_llm_model
 from llm.prompt.parse import PARSE_NEGATION, PARSE_QUERY, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION
 from rich import print as rprint
 
@@ -47,7 +47,7 @@ async def question_to_retrieval(text: str, is_question: bool) -> str:
 
     prompt = REWRITE_QUESTION.format(question=text)
     print("Converting question to retrieval query")
-    search_text = await llm_model.generate_from_text(prompt)
+    search_text = await small_llm_model.generate_from_text(prompt)
     if isinstance(search_text, dict) and "text" in search_text:
         search_text = search_text["text"]
     if search_text and isinstance(search_text, str):
@@ -79,7 +79,7 @@ async def parse_query(
     }
 
     prompt = PARSE_NEGATION.format(query=text)
-    response = await llm_model.generate_from_text(prompt)
+    response = await small_llm_model.generate_from_text(prompt)
     if isinstance(response, dict) and "text" in response:
         print(response)
         text = response["text"]
@@ -148,7 +148,7 @@ async def question_classification(question):
         return "location"
 
     prompt = QUESTION_CLASSIFICATION.format(question=question)
-    response = await llm_model.generate_from_text(prompt)
+    response = await small_llm_model.generate_from_text(prompt)
     if isinstance(response, dict) and "category" in response:
         return response["category"]
     else:

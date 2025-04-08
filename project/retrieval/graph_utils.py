@@ -12,7 +12,6 @@ from results.models import HeatmapResults
 
 logger = logging.getLogger(__name__)
 
-
 # Convert each date to its corresponding week format
 def to_week(date):
     """Convert date to formatted week string."""
@@ -33,11 +32,11 @@ def get_heatmap_data(data: Data, scores: List[float], high_score_indices: List[i
     if data == Data.Deakin:
         return get_deakin_heatmap_data(data, scores, high_score_indices)
     # return []
-    return [get_lsc_heatmap_data(data, scores, high_score_indices)]
+    return [get_lsc_heatmap_data(data, high_score_indices)]
 
 
 def get_lsc_heatmap_data(
-    data: Data, scores: List[float], high_score_indices: List[int]
+    data: Data, high_score_indices: List[int]
 ):
     # Create a day-to-count mapping using Counter for efficiency
     days = ["/".join(photo_id.split("/")[0:2]) for photo_id in photo_ids(data)]

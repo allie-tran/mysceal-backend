@@ -1,11 +1,12 @@
 import json
-import pandas as pd
-from io import BytesIO
 import logging
 from contextlib import asynccontextmanager
+from io import BytesIO
+import os
 from typing import List
 from uuid import uuid4
 
+import pandas as pd
 import redis
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
@@ -20,7 +21,6 @@ from database.segments import (
     EventSegment,
     EventSegments,
     annotate_segments_vllm,
-    get_keyframes_from_segments,
     get_saved_segments,
     save_segments_to_db,
 )
@@ -41,8 +41,13 @@ from query_parse.types.requests import (
     LoginResponse,
     SegmentRequest,
 )
-from results.models import AnswerResultWithEvent
-from retrieval.dynamic_segmentation import expand_single_image
+from query_parse.visual import get_model
+from results.lifelog_questions import create_video
+from results.models import AnswerResultWithEvent, TripletEvent
+from retrieval.dynamic_segmentation import (
+    expand_single_image,
+    get_keyframes_from_segments,
+)
 from retrieval.graph import get_vegalite, to_csv
 from retrieval.search import answer_single_event, get_segments_only, streaming_manager
 from submit.router import submit_router
@@ -278,11 +283,13 @@ async def get_segments(request: SegmentRequest):
         if saved_segments:
             return saved_segments
 
+    query = "I am eating, or preparing food, or food (or drink) is visible"
     events, num, eating = get_segments_only(
-        "I am eating, or drinking, or preparing food, or food (or drink) is visible",
+        query,
         EatingFilters(patient_id=[request.patient_id], date=[request.date]),
         data=request.data,
     )
+    encoded_query = get_model(Data.Deakin).encode_text(query)
 
     for i, event in enumerate(events):
         segments.append(
@@ -291,7 +298,9 @@ async def get_segments(request: SegmentRequest):
                 annotations=Annotation(
                     eating=eating[i],
                 ),
-                keyframes=get_keyframes_from_segments(request.data, event.images),
+                keyframes=get_keyframes_from_segments(
+                    encoded_query, request.data, event.images
+                ),
             )
         )
 
@@ -528,6 +537,7 @@ async def annotate_segments(request: SegmentRequest):
     )
     return segments
 
+
 @app.post("/download-segments", description="Download segments", status_code=200)
 async def download_segments(request: SegmentRequest):
     """
@@ -564,7 +574,34 @@ async def download_segments(request: SegmentRequest):
     df = pd.DataFrame(data)
     df.to_csv(file, index=False)
     file.seek(0)
-    return StreamingResponse(file, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=segments.csv"})
+    return StreamingResponse(
+        file,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=segments.csv"},
+    )
+
+@app.post("/export-to-video",
+    description="Export segments to video",
+    status_code=200)
+async def export_to_video(request: List[str]):
+    """
+    Export segments to video
+    """
+    video_path = create_video(Data.LSC23, request)
+
+    def iterfile():
+        with open(video_path, mode="rb") as file:
+            yield from file
+
+    file_size = os.path.getsize(video_path)
+
+    headers = {
+        "Content-Length": str(file_size),
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes"
+    }
+
+    return StreamingResponse(iterfile(), headers=headers, media_type="video/mp4")
 
 def to_title_case(string: str) -> str:
     return " ".join([word.capitalize() for word in string.split("_")])

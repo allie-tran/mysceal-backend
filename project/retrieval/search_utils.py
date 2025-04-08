@@ -24,7 +24,6 @@ from results.models import (
 from results.utils import create_event_label, deriving_fields
 from rich import print
 
-from retrieval.async_utils import async_generator_timer, timer
 from retrieval.types import ESResponse
 
 logger = logging.getLogger(__name__)
@@ -32,7 +31,7 @@ logger = logging.getLogger(__name__)
 json_headers = {"Content-Type": "application/json"}
 
 
-def clean(data: dict) -> dict:
+def clean(data: Any) -> dict:
     """
     Print the data in a clean format
     If any array is found, print only the first 5 elements
@@ -212,7 +211,7 @@ async def get_search_results(
     data: Data, request: ESSearchRequest
 ) -> EventResults | None:
     es_response = await send_search_request(request)
-    results = process_es_results(request.query, es_response, request.test, request.mode)
+    results = process_es_results(es_response, request.test, request.mode)
 
     if results is None:
         print("[red]get_search_results: No results found[/red]")
@@ -230,7 +229,6 @@ async def get_search_results(
 # POST-PROCESSING FUNCTIONS
 # ======================================== #
 def process_es_results(
-    query: str,
     response: ESResponse,
     test: bool = False,
     mode: Mode = Mode.event,
@@ -291,8 +289,8 @@ def merge_msearch_with_main_results(
     events = main_results.events
     scores = main_results.scores
 
-    doublets = []
-    doublet_scores = []
+    doublets: list[DoubletEvent] = []
+    doublet_scores: list[float] = []
     used_msearch = {}
 
     assert len(events) == len(msearch_results)
@@ -327,9 +325,9 @@ def merge_msearch_with_main_results(
         doublet_scores.append(scores[i] + msearch_result.scores[0])
 
     # Sort the doublets by the score
-    doublets, doublet_scores = zip(
-        *sorted(zip(doublets, doublet_scores), key=lambda x: x[1], reverse=True)
-    )
+    sorted_indices = sorted(range(len(doublet_scores)), key=lambda k: doublet_scores[k], reverse=True)
+    doublets = [doublets[i] for i in sorted_indices]
+    doublet_scores = [doublet_scores[i] for i in sorted_indices]
 
     return DoubletEventResults(events=doublets, scores=doublet_scores)
 
@@ -356,7 +354,6 @@ def process_search_results(results: GenericEventResults) -> List[TripletEvent]:
     triplet_results = []
     for main in results.events:
         triplet = TripletEvent(main=main)
-
         if isinstance(main, DoubletEvent):
             if main.condition.condition == "before":
                 triplet.before = main.conditional
@@ -402,6 +399,4 @@ def get_search_function(
             )
         case (before, main, after):
             raise NotImplementedError("Triplet is not implemented yet")
-        case _:
-            raise ValueError("Invalid query")
     return search_function

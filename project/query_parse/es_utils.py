@@ -4,7 +4,7 @@ from rich import print
 
 from results.models import EventResults
 
-from query_parse.constants import GPS_NORMAL_CASE, MAP_VISUALISATION
+# from query_parse.constants import GPS_NORMAL_CASE, MAP_VISUALISATION
 from query_parse.time import MONTHS
 from query_parse.types.elasticsearch import (
     GPS,
@@ -14,7 +14,7 @@ from query_parse.types.elasticsearch import (
     ESFilter,
     ESFuzzyMatch,
     ESGeoBoundingBox,
-    ESGeoDistance,
+    # ESGeoDistance,
     ESMatch,
     ESOrFilters,
     ESRangeFilter,
@@ -298,18 +298,18 @@ def get_location_filters(locationinfo: LocationInfo) -> Sequence[ESCombineFilter
 
     queries = []
     for loc in locations:
-        place = GPS_NORMAL_CASE[loc]
-        dist, pivot = get_location_search_parameters(loc)
+        # place = GPS_NORMAL_CASE[loc]
+        # dist, pivot = get_location_search_parameters(loc)
 
-        # GeoDistance query
-        for place_iter, (lat, lon) in MAP_VISUALISATION:
-            if place == place_iter:
-                queries.append(
-                    ESGeoDistance(lat=lat, lon=lon, distance=dist, pivot=pivot)
-                )
+        # # GeoDistance query
+        # for place_iter, (lat, lon) in MAP_VISUALISATION:
+        #     if place == place_iter:
+        #         queries.append(
+        #             ESGeoDistance(lat=lat, lon=lon, distance=dist, pivot=pivot)
+        #         )
 
         # Match query
-        queries.append(ESMatch(field="location", query=loc, boost=0.0005))
+        queries.append(ESMatch(name="LOCATION_MATCH", field="location", query=loc, boost=0.0005))
 
     place_filters = ESOrFilters(name="PLACE", queries=queries)
     place_type_filters = ESMatch(
@@ -390,6 +390,4 @@ def get_conditional_time_filters(
                         "start_timestamp",
                     )
                 )
-            case _:
-                raise ValueError("Invalid time condition")
     return filters
