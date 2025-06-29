@@ -5,7 +5,6 @@ from database.main import es_collection, get_db
 from myeachtra.dependencies import ObjectId
 from openai import BaseModel
 from pydantic import SkipValidation, model_validator
-from retrieval.async_utils import async_generator_timer, async_timer
 from retrieval.search_utils import send_search_request
 
 from query_parse.es_utils import (
@@ -17,19 +16,17 @@ from query_parse.location import search_for_locations
 from query_parse.question import parse_query
 from query_parse.time import TimeTagger, search_for_time
 from query_parse.types.elasticsearch import (
-    ESAndFilters,
     ESBoolQuery,
     ESCombineFilters,
     ESEmbedding,
     ESFilter,
-    ESNot,
     ESNotFilters,
     ESSearchRequest,
     LocationInfo,
     TimeInfo,
     VisualInfo,
 )
-from query_parse.types.lifelog import EatingFilters, Mode, SingleQuery
+from query_parse.types.lifelog import EatingFilters, Mode, ParsedQuery, SingleQuery
 from query_parse.types.requests import Data
 from query_parse.visual import search_for_visual
 
@@ -61,6 +58,7 @@ class Query(BaseModel):
 
 class ComboQuery(BaseModel):
     data: Data = Data.LSC23
+    parsed_query: ParsedQuery
 
     original_text: str = ""
     is_question: bool = False
@@ -166,6 +164,7 @@ async def extract_info(
         after=extract_part(query_parts.after),
         must_not=extract_part(query_parts.must_not),
         original_text=text,
+        parsed_query=query_parts,
         is_question=is_question,
         data=data,
     )

@@ -218,6 +218,7 @@ class EatingFilters(CamelCaseModel):
         return "\n".join(explanation)
 
 class SingleQuery(CamelCaseModel):
+    full_text: str = ""
     visual: str = ""
     location: str = ""
     time: str = ""
@@ -228,7 +229,22 @@ class SingleQuery(CamelCaseModel):
         return any([self.visual, self.location, self.time, self.date])
 
 class ParsedQuery(CamelCaseModel):
-    main: SingleQuery
-    after: SingleQuery | None = None
-    before: SingleQuery | None = None
-    must_not: SingleQuery | None = None
+    queries: List[SingleQuery] = []
+    main_event: int = 0
+
+    @property
+    def multiple_queries(self) -> bool:
+        """
+        Check if the query contains multiple queries
+        """
+        return len(self.queries) > 1
+
+    @property
+    def main(self) -> SingleQuery:
+        """
+        Get all queries in the parsed query
+        """
+        if self.multiple_queries:
+            return self.queries[self.main_event]
+        return self.queries[0]
+

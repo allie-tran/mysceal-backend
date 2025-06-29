@@ -3,11 +3,11 @@ All utilities related to question answering
 """
 
 import re
-from collections import defaultdict
+from typing import Dict, List, TypedDict
 
 from configs import QUERY_PARSER
-from llm import small_llm_model
-from llm.prompt.parse import PARSE_NEGATION, PARSE_QUERY, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION
+from llm import small_llm_model, gpt_llm_model as llm_model
+from llm.prompt.parse import QUERY_PARSE_PROMPT, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION, SPLIT_QUERY_PROMPT
 from rich import print as rprint
 
 from query_parse.types.lifelog import EatingFilters, ParsedQuery, SingleQuery
@@ -71,67 +71,98 @@ async def parse_query(
     """
     Get the relevant fields from the query
     """
-    template = {
-        "main": defaultdict(lambda: text),
-        "after": defaultdict(str),
-        "before": defaultdict(str),
-        "must_not": defaultdict(str),
-    }
+    # template = {
+    # 	"main": defaultdict(lambda: search_text),
+    # 	"after": defaultdict(str),
+    # 	"hours_after": "1-2",
+    # 	"before": defaultdict(str),
+    # 	"hours_before": "1-2",
+    # 	"must_not": defaultdict(str),
+    # }
 
-    prompt = PARSE_NEGATION.format(query=text)
-    response = await small_llm_model.generate_from_text(prompt)
-    if isinstance(response, dict) and "text" in response:
-        print(response)
-        text = response["text"]
-        main = SingleQuery(visual=text, location=text, time=text, date=text)
-        must_not = response.get("must_not", "")
-        if must_not:
-            must_not = SingleQuery(visual=must_not, location=must_not, time=must_not, date=must_not)
-            return ParsedQuery(main=main, must_not=must_not)
-        else:
-            return ParsedQuery(main=main)
-    main = SingleQuery(visual=text, location=text, time=text, date=text)
-    return ParsedQuery(main=main)
+    # prompt = PARSE_NEGATION.format(query=text)
+    # response = await gpt_llm_model.generate_from_text(prompt)
+    # if isinstance(response, dict) and "text" in response:
+    #     print(response)
+    #     text = response["text"]
+    #     main = SingleQuery(visual=text, location=text, time=text, date=text)
+    #     must_not = response.get("must_not", "")
+    #     if must_not:
+    #         must_not = SingleQuery(visual=must_not, location=must_not, time=must_not, date=must_not)
+    #         return ParsedQuery(main=main, must_not=must_not)
+    #     else:
+    #         return ParsedQuery(main=main)
+    # main = SingleQuery(visual=text, location=text, time=text, date=text)
+    # return ParsedQuery(main=main)
 
     if QUERY_PARSER or is_question or eating_filters:
-        pass
-        # # in some cases, it's inefficient to parse the query
-        # if eating_filters is None and detect_simple_query(text):
-        #     main = SingleQuery(visual=text, location=text, time=text, date=text)
-        #     return ParsedQuery(main=main)
+        # in some cases, it's inefficient to parse the query
+        if eating_filters is None and detect_simple_query(text):
+            main = SingleQuery(visual=text, location=text, time=text, date=text)
+            return ParsedQuery(queries=[main], main_event=0)
 
-        # eating_query = eating_filters.format() if eating_filters else ""
-        # if eating_query:
-        #     eating_query = f"Eating filters: {eating_query}"
+        res = await lsc25_get_parse_queries(text)
+        events = res.get("events", [])
+        parsed = ParsedQuery(queries=[], main_event=res.get("main_event", 0))
+        for event in events:
+            partial_query = SingleQuery(
+                full_text=event.get("event", ""),
+                visual=event.get("visual", ""),
+                location=event.get("location", ""),
+                time=event.get("time", ""),
+                date="",
+                filters=eating_filters or EatingFilters(),
+            )
+            parsed.queries.append(partial_query)
+        return parsed
 
-        # prompt = REWRITE_QUERY.format(query=text, eating_filters=eating_query)
-        # search_text = await llm_model.generate_from_text(prompt)
-        # if isinstance(search_text, dict) and "text" in search_text:
-        #     print(search_text)
-        #     text = search_text["text"]
+    main = SingleQuery(visual=text, location=text, time=text, date=text, filters=eating_filters or EatingFilters())
+    return ParsedQuery(queries=[main], main_event=0)
 
-        # prompt = PARSE_QUERY.format(
-        #     query=text, eating_filters=eating_query
-        # )
-        # feat = await llm_model.generate_from_text(prompt)
-        # if isinstance(feat, dict):
-        #     for key, value in feat.items():
-        #         if key in template:
-        #             query = template[key]
-        #             for k, v in value.items():
-        #                 query[k] = v
+async def rewrite_query(eating_filters, text):
+    eating_query = eating_filters.format() if eating_filters else ""
+    if eating_query:
+        eating_query = f"Eating filters: {eating_query}"
 
-        #             # add location into main
-        #             if "location" in query and "visual" in query:
-        #                 if query["location"] != query["visual"]:
-        #                     query["visual"] = query["visual"] + " " + query["location"]
+    prompt = REWRITE_QUERY.format(query=text, eating_filters=eating_query)
+    search_text = await llm_model.generate_from_text(prompt)
+    if isinstance(search_text, dict) and "text" in search_text:
+        print(search_text)
+        text = search_text["text"]
+    return text, eating_query
 
-        # else:
-        #     print("Failed to parse query")
-        #     print(feat)
+class ParsedQueryResult(TypedDict):
+    """
+    Parsed query result type
+    """
+    queries: List[Dict[str, str]]
+    main_event: int
 
-    parsed_query = ParsedQuery.model_validate(template)
-    return parsed_query
+async def lsc25_get_parse_queries(hint)-> ParsedQueryResult:
+    parsed = await llm_model.generate_from_text(QUERY_PARSE_PROMPT.format(query=hint))
+    if parsed is None:
+        rprint("[red]No results found for the query parsing. Using the hint as the event.[/red]")
+        parsed = {"temporal_events": [hint], "max_time": 0, "main_event": 0}
+
+    results = await llm_model.generate_from_text(SPLIT_QUERY_PROMPT.format(
+        summary=hint,
+        events="\n".join(parsed.get("temporal_events", [])),
+        model="gpt-4o"
+    ))
+    print("Results from query splitting:", results)
+    if not results:
+        rprint("[red]No results found for the query splitting. Using the hint as the event.[/red]")
+        results = {"events": [
+            {
+                "event": hint,
+                "visual_information": hint,
+                "temporal_information": "",
+                "spatial_information": ""
+            }
+        ], "max_time": 0, "main_event": 0}
+    results["max_time"] = parsed.get("max_time", 0)
+    results["main_event"] = parsed.get("main_event", 0)
+    return results  # type: ignore
 
 
 async def question_classification(question):

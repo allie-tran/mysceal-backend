@@ -122,29 +122,3 @@ def get_timeline_for_date(
     group_range_ids = [group["group"] for group in group_ids]
     results = get_scene_for_group_ids(group_range_ids)
     return TimelineResult(date=start_time, result=results)
-
-
-def get_more_scenes(
-    group_id: str, direction: str = "before", data: Data = Data.LSC23
-) -> Optional[TimelineResult]:
-    """
-    Get more scenes before or after the given group id
-    """
-    db = get_db(data)
-    group_info = group_collection(db).find_one({"group": group_id})
-    if not group_info:
-        return None
-
-    group_date = group_info["start_time"]
-    if direction == "before":
-        group_ids = group_collection(db).find(
-            {"end_time": {"$lt": group_date}}, {"group": 1}
-        )
-    else:
-        group_ids = group_collection(db).find(
-            {"start_time": {"$gt": group_date}}, {"group": 1}
-        )
-
-    group_range_ids = [group["group"] for group in group_ids]
-    results = get_scene_for_group_ids(group_range_ids)
-    return TimelineResult(date=group_date, result=results)

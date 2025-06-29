@@ -133,8 +133,9 @@ class Event(CamelCaseModel):
     name: str = ""
     images: List[Image] = []
 
-    start_time: datetime = Field(..., exclude=True)
-    end_time: datetime = Field(..., exclude=True)
+    start_time: datetime
+    end_time: datetime
+    timezone: str = "UTC"
     duration: float = 30 # 30 seconds
 
     location: str = ""
@@ -358,7 +359,7 @@ class TripletEvent(CamelCaseModel):
 
 class HeatmapResults(Results):
     name: str = ""
-    values: List[List[int | None]] = []
+    values: Sequence[Sequence[int | float | None]] = []
     hover_info: List[List[str]] = []
     x_labels: List[str] = []
     x_ticks: List[float] = []
@@ -520,7 +521,7 @@ class LocationInfoResult(Marker):
     related_events: List[PartialEvent] = []
     address: str = ""
 
-ResultT = TypeVar("ResultT", EventResults, RelevantFields, List[str])
+ResultT = TypeVar("ResultT", TripletEventResults, RelevantFields, List[str])
 
 class AsyncioTaskResult(CamelCaseModel, Generic[ResultT]):
     results: Optional[ResultT] = None

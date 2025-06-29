@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Generic, List, Optional, Self, TypeVar
+from typing import Generic, List, Optional, Self, TypeVar
 
 from pydantic import (
     Field,
@@ -67,8 +67,10 @@ class GeneralRequestModel(TimeStampModel, Generic[RequestT, ResponseT]):
     @model_validator(mode="after")
     def insert_request(self) -> Self:
         if not CACHE:
+            print("Cache is disabled")
             return self
         if not self.oid:
+            print("Inserting request into cache")
             # Find the request in the database
             existing_request = find_request(self.request)
             if existing_request:
@@ -83,6 +85,7 @@ class GeneralRequestModel(TimeStampModel, Generic[RequestT, ResponseT]):
                 inserted = request_collection(db).insert_one(
                     self.model_dump(exclude={"responses"})
                 )
+                print(f"Inserted request with oid: {inserted.inserted_id}")
                 self.oid = inserted.inserted_id
         return self
 
@@ -105,6 +108,7 @@ class GeneralRequestModel(TimeStampModel, Generic[RequestT, ResponseT]):
             return
         self.finished = True
         db = get_db(self.request.data)
+        print(f"Marking request {self.oid} as finished")
         request_collection(db).update_one(
             {"_id": self.oid}, {"$set": {"finished": True}}, upsert=True
         )

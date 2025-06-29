@@ -24,12 +24,12 @@ class GroqLLM(LLM):
         self.client = Groq(api_key=GROQ_AI)
         self.model_name = name
 
-    async def generate(self, messages: List[ChatCompletionMessageParam]):
+    async def generate(self, messages: List[ChatCompletionMessageParam], model: str | None = None):
         """
         Generate completions from a list of messages
         """
         request = self.client.chat.completions.create(
-            model=self.model_name, messages=messages, stream=True,
+            model=model or self.model_name, messages=messages, stream=True,
             temperature=0.1,
         )
 

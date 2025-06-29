@@ -249,6 +249,7 @@ def extend_no_duplicates(list1: List[T], list2: List[T]) -> List[T]:
     for item in list2:
         if item and item not in list1:
             list1.append(item)
+    list1 = [item for item in list1 if item]
     return list1
 
 

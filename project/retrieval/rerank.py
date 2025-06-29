@@ -11,7 +11,12 @@ from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 
 processor_path = "Qwen/Qwen2-VL-2B-Instruct"
-model_path = "lightonai/MonoQwen2-VL-v0.1"
+model = "lightonai/MonoQwen2-VL-v0.1"
+# model = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+# model = "mistralai/Pixtral-12B-2409"
+# model = "mistralai/Ministral-8B-Instruct-2410"
+
+# model_path = "Tarsier2-7b-0115"
 device = "cpu"
 if not FORCE_CPU and torch.cuda.is_available():
     device = "cuda"
@@ -27,7 +32,9 @@ class Reranker:
             device_map=device,
         )
 
-    def score(self, data: Data, query: str, image_paths: list[str]):
+    def score(self, data: Data, query: str, image_paths: list[str], prompt: str = "",
+              tokens=["True", "False"]
+              ):
         image_paths = [
             os.path.join(IMAGE_DIRECTORY, data, image_path)
             for image_path in image_paths
@@ -35,10 +42,12 @@ class Reranker:
         collage = get_collage_image(image_paths)
         if not collage:
             return 0.0
-        prompt = (
-            "Assert the relevance of the previous image document to the following query/question, "
-            "answer True or False. The query is: {query}"
-        ).format(query=query)
+        if not prompt:
+            prompt = (
+                "Assert the relevance of the previous image document to the following query/question, "
+                "answer True or False. The query is: {query}"
+            ).format(query=query)
+
         messages = [
             {
                 "role": "user",
@@ -60,10 +69,15 @@ class Reranker:
         with torch.no_grad():
             outputs = self.model(**inputs)
             logits_for_last_token = outputs.logits[:, -1, :]
+            output_logits = outputs.logits
 
+        decoded_text = self.processor.batch_decode(
+            output_logits.argmax(dim=-1), skip_special_tokens=True
+        )[0]
+        print(f"Decoded text: {decoded_text}")
         # Convert tokens and calculate relevance score
-        true_token_id = self.processor.tokenizer.convert_tokens_to_ids("True")
-        false_token_id = self.processor.tokenizer.convert_tokens_to_ids("False")
+        true_token_id = self.processor.tokenizer.convert_tokens_to_ids(tokens[0])
+        false_token_id = self.processor.tokenizer.convert_tokens_to_ids(tokens[1])
         relevance_score = torch.softmax(
             logits_for_last_token[:, [true_token_id, false_token_id]], dim=-1
         )
@@ -89,5 +103,5 @@ class Reranker:
 
 
 # reranker = None
-reranker = Reranker(processor_path, model_path)
+reranker = Reranker(processor_path, model)
 print("Reranker initialized")

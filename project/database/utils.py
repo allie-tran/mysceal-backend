@@ -1,5 +1,6 @@
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 from configs import ESSENTIAL_FIELDS, IMAGE_ESSENTIAL_FIELDS
 from geopy.geocoders import Nominatim
@@ -9,10 +10,10 @@ from myeachtra.dependencies import memory
 from pydantic import ValidationError
 from pydantic.alias_generators import to_camel
 from query_parse.types.elasticsearch import GPS
+from query_parse.types.lifelog import RelevantFields
 from query_parse.types.requests import ChoicesResponse, Data, MapRequest
 from query_parse.utils import extend_no_duplicates
 from results.models import AsyncioTaskResult, Event, Icon, Image, Marker
-from results.utils import RelevantFields
 from retrieval.async_utils import async_timer
 from rich import print as rprint
 
@@ -33,6 +34,11 @@ def to_event(data: Data, image: dict) -> Event:
             image["time"] = image["snap"]["local_time"]
         image["start_time"] = image.pop("time")
         image["end_time"] = image["start_time"]
+        timezone = image.pop("timezone", "UTC")
+        image["timezone"] = timezone
+        image["start_time"] = image["start_time"].astimezone(ZoneInfo(timezone))
+        image["end_time"] = image["end_time"].astimezone(ZoneInfo(timezone))
+
         image["images"] = [
             Image(
                 src=image.pop("image"),
@@ -102,18 +108,51 @@ def convert_to_events(
         event.markers, event.orphans = calculate_markers(event)
     return events
 
+
 def image_src_to_image_object(images: List[str], data: Data) -> List[Image]:
     db = get_db(data)
     documents = image_collection(db).find({"image": {"$in": images}})
     docs = {
-        doc["image"]: Image(src=doc["image"], aspect_ratio=doc["aspect_ratio"], hash_code=doc["hash_code"])
+        doc["image"]: Image(
+            src=doc["image"],
+            aspect_ratio=doc["aspect_ratio"],
+            hash_code=doc["hash_code"],
+        )
         for doc in documents
     }
     return [docs[image] for image in images if image in docs]
 
+def segment_to_event(
+    data: Data,
+    images: List[str],
+) -> Event | None:
+    """
+    Convert a list of images and scores to an Event object
+    """
+    db = get_db(data)
+    documents = image_collection(db).find({"image": {"$in": images}})
+    image_to_doc = {doc["image"]: doc for doc in documents}
+    images = [img for img in images if img in image_to_doc]
+
+    if not image_to_doc:
+        print(f"No images found in the database for {images}")
+        return None
+
+    main_image = image_to_doc[images[0]]
+    event = to_event(data, main_image)
+
+    if len(images) > 1:
+        rest_images = [image_to_doc[img] for img in images[1:] if img in image_to_doc]
+        rest_events = [to_event(data, img) for img in rest_images]
+        event.merge_with_many(1, rest_events, [1] * len(rest_events))
+
+    event.markers, event.orphans = calculate_markers(event)
+    return event
+
+
 def segments_to_events(
     data: Data,
-    segments: List[Tuple[int, int]],
+    segments: Union[List[Tuple[int, int]], List[List[str]]],
     scores,
     photo_ids: List[str],
     relevant_fields: Optional[List[str]] = None,
@@ -123,8 +162,13 @@ def segments_to_events(
     """
     db = get_db(data)
     images = []
-    for start, end in segments:
-        images.extend(photo_ids[start:end])
+    for segment in segments:
+        if isinstance(segment, list):
+            images.extend(segment)
+        else:
+            start, end = segment
+            images.extend(photo_ids[start:end])
+
     documents = []
 
     if relevant_fields:
@@ -141,15 +185,23 @@ def segments_to_events(
 
     image_to_doc = {doc["image"]: doc for doc in documents}
     events = []
-    for (start, end), score in zip(segments, scores):
+    for segment, score in zip(segments, scores):
+        images = []
+        if isinstance(segment, list):
+            images = segment
+        else:
+            start, end = segment
+            images = photo_ids[start:end]
         event_images = [
-            photo for photo in photo_ids[start:end] if photo in image_to_doc
+            photo for photo in images if photo in image_to_doc
         ]
         if not event_images:
             continue
         event = to_event(data, image_to_doc[event_images[0]])
         if len(event_images) > 1:
-            rest = [to_event(data, image_to_doc[photo_id]) for photo_id in event_images[1:]]
+            rest = [
+                to_event(data, image_to_doc[photo_id]) for photo_id in event_images[1:]
+            ]
             event.merge_with_many(score, rest, [score] * len(rest))
         events.append(event)
 
@@ -157,6 +209,7 @@ def segments_to_events(
         event.markers, event.orphans = calculate_markers(event)
 
     return events
+
 
 def get_event_from_images(images: List[str], data: Data) -> Event:
     db = get_db(data)
@@ -167,6 +220,7 @@ def get_event_from_images(images: List[str], data: Data) -> Event:
     event = docs[0]
     event.merge_with_many(1, docs[1:], [1] * len(docs[1:]))
     return event
+
 
 def calculate_markers(event: Event) -> Tuple[List[Marker], List[GPS]]:
     """
@@ -519,7 +573,9 @@ def get_full_data(images: List[str], data: Data) -> Dict[str, Dict[str, Any]]:
     return image_data
 
 
-def get_unique_values(data: Data, field: str, condition: Optional[dict[str, Any]] = None) -> List[str]:
+def get_unique_values(
+    data: Data, field: str, condition: Optional[dict[str, Any]] = None
+) -> List[str]:
     """
     Get the unique values for a field
     """
@@ -530,6 +586,7 @@ def get_unique_values(data: Data, field: str, condition: Optional[dict[str, Any]
         values = image_collection(db).distinct(field)
     return values
 
+
 def get_unique_patient_ids():
     db = get_db(Data.Deakin)
     # get all unique patientIds along with number of dates
@@ -537,6 +594,7 @@ def get_unique_patient_ids():
         [
             {"$group": {"_id": "$patient.id", "dates": {"$addToSet": "$date"}}},
             {"$project": {"patientId": "$_id", "dates": {"$size": "$dates"}}},
+            {"$sort": {"patientId": 1}},
         ]
     )
     values = list(values)
@@ -545,3 +603,56 @@ def get_unique_patient_ids():
     return ChoicesResponse(choices=choices, annotations=annotations)
 
 
+def get_segment_counts_per_date(
+    patient_id: str | None = None,
+) -> dict[str, tuple[int, int]]:
+    match_stage = {}
+    if patient_id:
+        match_stage["patient_id"] = patient_id
+    pipeline = [
+        {"$match": {"patient_id": patient_id}} if patient_id else {},
+        {
+            "$project": {
+                "date": 1,
+                "segment_count": {"$size": {"$ifNull": ["$segments", []]}},
+                "eating_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": {"$ifNull": ["$segments", []]},
+                            "as": "s",
+                            "cond": {"$eq": ["$$s.annotations.eating", True]},
+                        }
+                    }
+                },
+            }
+        },
+    ]
+
+    # Remove empty match stage if not needed
+    pipeline = [stage for stage in pipeline if stage]
+
+    db = get_db(Data.Deakin)
+    segments_collection = db["segments"]
+    results = list(segments_collection.aggregate(pipeline))
+
+    return {
+        result["date"]: (result["segment_count"], result["eating_count"])
+        for result in results
+    }
+
+
+def get_image_counts_per_date(patient_id: str | None = None) -> dict[str, int]:
+    match_stage = {}
+    if patient_id:
+        match_stage["patient.id"] = patient_id
+
+    pipeline = [
+        {"$match": match_stage} if match_stage else {},
+        {"$group": {"_id": "$date", "image_count": {"$sum": 1}}},
+    ]
+
+    pipeline = [stage for stage in pipeline if stage]
+
+    db = get_db(Data.Deakin)
+    results = list(image_collection(db).aggregate(pipeline))
+    return {result["_id"]: result["image_count"] for result in results}

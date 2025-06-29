@@ -1,13 +1,24 @@
 import os
-from typing import List
+from typing import Dict, List
 
 import bcrypt
 import jwt
 import redis
-from configs import REDIS_HOST, REDIS_PORT
+from configs import DRES_URL, REDIS_HOST, REDIS_PORT
 from database.main import user_collection
+from dres_client import Client
+from dres_client.api.user import post_api_v2_login
+from dres_client.models import LoginRequest as DRESLoginRequest
+from dres_client.models.api_user import ApiUser
+from dres_client.models.error_status import ErrorStatus
 from fastapi import HTTPException, Request
-from query_parse.types.requests import CreateUserRequest, Data, LoginRequest, LoginResponse
+from query_parse.types.requests import (
+    CreateUserRequest,
+    Data,
+    LoginRequest,
+    LoginResponse,
+)
+from rich import print
 
 from myeachtra.dependencies import CamelCaseModel
 
@@ -28,8 +39,6 @@ def flush_redis() -> None:
 
 
 # flush_redis()
-
-
 def create_user(request: CreateUserRequest, overwrite=False) -> None:
     """
     Create a new user
@@ -43,6 +52,7 @@ def create_user(request: CreateUserRequest, overwrite=False) -> None:
             "$set": {
                 "password": bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()),
                 "data_access": request.data_access,
+                "dres": request.dres,
             }
         },
         upsert=True,
@@ -52,39 +62,31 @@ def create_user(request: CreateUserRequest, overwrite=False) -> None:
 
 # Create some users now
 def create_users() -> None:
-    admin = CreateUserRequest(
-        username=os.getenv("ADMIN_USERNAME", ""),
-        password=os.getenv("ADMIN_PASSWORD", ""),
-        data_access=[Data.LSC23, Data.Deakin],
-    )
-    # lsc181 = CreateUserRequest(
-    #     username=os.getenv("LSC_USERNAME", ""),
-    #     password=os.getenv("LSC_PASSWORD", ""),
-    #     data_access=[Data.LSC23],
+    # admin = CreateUserRequest(
+    #     username=os.getenv("ADMIN_USERNAME", ""),
+    #     password=os.getenv("ADMIN_PASSWORD", ""),
+    #     data_access=[Data.LSC23, Data.Deakin],
     # )
-    # tiens = CreateUserRequest(
-    #     username=os.getenv("TIENS_USERNAME", ""),
-    #     password=os.getenv("TIENS_PASSWORD", ""),
-    #     data_access=[Data.LSC23],
-    # )
-    charlies = CreateUserRequest(
-        username="charlie",
-        password="lifelogvr",
-        data_access=[Data.LSC23],
-    )
     # create_user(admin, overwrite=True)
-    # create_user(lsc181)
-    # create_user(tiens)
-    create_user(charlies)
+    dres = CreateUserRequest(
+        username="deakin",
+        password="wceating",
+        data_access=[Data.Deakin],
+    )
+    create_user(dres, overwrite=True)
 
 
-# create_users()
+create_users()
 
-def generate_token(username: str) -> str:
+
+def generate_token(username: str, dres_token: str | None = None) -> str:
     """
     Generate a token for the user
     """
-    return jwt.encode({"username": username}, SECRET, algorithm="HS256")
+    return jwt.encode(
+        {"username": username, "dres_token": dres_token}, SECRET, algorithm="HS256"
+    )
+
 
 def find_user_by_username(username: str) -> UserDetail:
     """
@@ -104,6 +106,33 @@ def verify_user(request: LoginRequest) -> LoginResponse:
     if not user:
         raise HTTPException(status_code=401, detail="User does not exist")
     if bcrypt.checkpw(request.password.encode(), user["password"]):
+        if request.dres or user.get("dres", False):
+            print("DRES login requested")
+            client = Client(base_url=DRES_URL)
+            with client as client:
+                response = post_api_v2_login.sync_detailed(
+                    client=client,
+                    body=DRESLoginRequest(
+                        username=request.username, password=request.password
+                    ),
+                )
+                if response.status_code == 200:
+                    if isinstance(response.parsed, ApiUser):
+                        dres_session_id = str(response.parsed.session_id)
+                        return LoginResponse(
+                            data_access=user["data_access"],
+                            session_id=generate_token(
+                                request.username, dres_token=dres_session_id
+                            ),
+                            dres_session_id=dres_session_id,
+                        )
+                elif isinstance(response.parsed, ErrorStatus):
+                    raise HTTPException(
+                        status_code=401,
+                        detail=f"DRES login failed with {response.parsed.description}",
+                    )
+                else:
+                    raise HTTPException(status_code=401, detail="DRES login failed")
         return LoginResponse(
             data_access=user["data_access"],
             session_id=generate_token(request.username),
@@ -112,12 +141,15 @@ def verify_user(request: LoginRequest) -> LoginResponse:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
-def verify_token(token: str) -> str:
+def verify_token(token: str) -> Dict[str, str | None]:
     """
     Verify the token and return the username
     """
     try:
-        return jwt.decode(token, SECRET, algorithms=["HS256"])["username"]
+        data = jwt.decode(token, SECRET, algorithms=["HS256"])
+        if "username" not in data:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return data
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token is expired")
     except jwt.InvalidTokenError:
@@ -131,7 +163,10 @@ async def get_user(request: Request) -> UserDetail:
     token = request.headers.get("Authorization")  # Bearer token
     if not token:
         raise HTTPException(status_code=401, detail="Please log in")
-    username = verify_token(token.split(" ")[1])
+    username = verify_token(token.split(" ")[1])["username"]
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     user = find_user_by_username(username)
     request_data = await request.json()
     verify_data_access(Data(request_data["data"]), user)

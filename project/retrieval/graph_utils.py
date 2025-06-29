@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from database.utils import get_unique_values
 from query_parse.types.requests import Data
-from query_parse.visual import photo_ids
+from visual.main import photo_ids
 from results.models import HeatmapResults
 
 logger = logging.getLogger(__name__)
@@ -284,3 +284,30 @@ def get_deakin_heatmap_per_hours(data: Data, scores: List[float], high_score_ind
                     )
                 )
     return heatmaps
+
+
+def get_heatmap_from_images(
+    images: List[str], scores: List[float]
+) -> HeatmapResults:
+    """
+    Get the heatmap data for a list of images
+    """
+    # split the images into rows of maximum 100 images
+    rows = []
+    row_scores = []
+    for i in range(0, len(images), 100):
+        rows.append(images[i : i + 100])
+        row_scores.append(scores[i : i + 100])
+
+    # Create hover info
+    hover_info = []
+    for row in row_scores:
+        hover_info.append([f"{image} ({score})" for image, score in zip(images, row)])
+
+    return HeatmapResults(
+        name="Images",
+        values=row_scores,
+        hover_info=hover_info,
+        x_ticks=list(range(100)),
+        x_labels=[str(i) for i in range(100)],
+    )

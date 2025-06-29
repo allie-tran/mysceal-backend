@@ -78,7 +78,7 @@ class SubmitAnswerRequest(CamelCaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     evaluation_id: str
     session_id: str = Field(..., serialization_alias="session")
-    query_type: str 
+    query_type: str
     answer: str
 
 

@@ -4,7 +4,7 @@
 
 from datetime import datetime
 from enum import Enum, StrEnum
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from myeachtra.dependencies import CamelCaseModel, ObjectId
 from pydantic import (
@@ -31,6 +31,7 @@ class Data(StrEnum):
 class LoginRequest(CamelCaseModel):
     username: str
     password: str
+    dres: Optional[bool] = False
 
 class VerifyTokenRequest(CamelCaseModel):
     token: str
@@ -41,13 +42,12 @@ class CreateUserRequest(LoginRequest):
 class LoginResponse(CamelCaseModel):
     session_id: str
     data_access: List[Data] = []
+    dres_session_id: Optional[str] = None
 
 
 # ====================== #
 # Search
 # ====================== #
-
-
 class Step(CamelCaseModel):
     step: PositiveInt
     total: PositiveInt
@@ -74,9 +74,14 @@ class TemplateRequest(CamelCaseModel):
             exclude={"session_id", "_id"},
         )
 
+
         # Turn dict in to "request.name", "request.finished", etc
         criteria = {"finished": True, "name": self.__class__.__name__}
         for key, value in self_dict.items():
+            if isinstance(value, StrEnum):
+                value = value.value
+            if not value:
+                continue
             criteria[f"request.{key}"] = value
 
         return criteria
@@ -88,6 +93,9 @@ class Task(str, Enum):
     KIS = "KIS"
     NONE = ""
 
+
+class EditSearch(CamelCaseModel):
+    window_size: int = 10000
 
 class GeneralQueryRequest(TemplateRequest):
 
@@ -111,6 +119,9 @@ class GeneralQueryRequest(TemplateRequest):
     # Miscs
     pipeline: Optional["SearchPipeline"] = None
     exclude_images: Optional[List[str]] = None
+
+    # edit search
+    edit_search: Optional[EditSearch] = None
 
 
 class TimelineRequest(TemplateRequest):
@@ -154,6 +165,12 @@ class SegmentRequest(TemplateRequest):
 
 class ExpandSegmentRequest(SegmentRequest):
     image: str = ""
+
+class EditAnnotationRequest(TemplateRequest):
+    patient_id: str = ""
+    date: str = ""
+    segment_id: int = -1
+    annotations: Dict[str, Any] = {}
 
 # ====================== #
 # MAP REQUESTS
@@ -208,6 +225,9 @@ class AnswerThisRequest(TemplateRequest):
     image: str
     question: str
     relevant_fields: Optional[List[str]] = None
+
+class SimilaritySearchRequest(TemplateRequest):
+    image: str
 
 
 # ====================== #

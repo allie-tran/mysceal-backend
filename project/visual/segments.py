@@ -1,0 +1,348 @@
+import json
+import os
+from typing import Dict, List, Set, Tuple
+
+import numpy as np
+import pandas as pd
+from configs import CLIP_EMBEDDINGS, DATA_DIRECTORY
+from database.main import get_db, image_collection
+from database.utils import segments_to_events
+from query_parse.types.requests import Data
+from results.models import Event
+from retrieval.async_utils import timer
+from rich import print as rprint
+
+from visual.features import SIGLIP_FEATURES
+from visual.low_visual import blurred_indices
+
+
+def compare_images(data: Data, image1: dict, image2: dict):
+    """
+    For the LSC23 dataset, fixed boundaries are:
+    - different locations
+    - time gap where the camera is off
+    For Deakin, fixed boundaries are:
+    - different patientID
+    - time gap where the camera is off
+    """
+    time_gap = 60 * 5  # 5 minutes
+    if data == Data.LSC23:
+        if image1["location"] != image2["location"]:
+            return True
+        if (image1["utc_time"] - image2["utc_time"]).total_seconds() > time_gap:
+            return True
+    elif data == Data.Deakin:
+        if image1["patient"]["id"] != image2["patient"]["id"]:
+            return True
+        if (
+            image1["snap"]["local_time"] - image2["snap"]["local_time"]
+        ).total_seconds() > time_gap:
+            return True
+        if image1["date"] != image2["date"]:
+            return True
+
+    return False
+
+
+def get_fixed_boundaries(data):
+    sort_criteria = None
+    if data == Data.LSC23:
+        sort_criteria = [("utc_time", 1)]
+    elif data == Data.Deakin:
+        sort_criteria = [("patient.id", 1), ("snap.local_time", 1)]
+
+    boundaries: set[int] = set()
+    prev_image = None
+    for image_data in image_collection(get_db(data)).find().sort(sort_criteria):
+        if prev_image is not None:
+            if compare_images(data, prev_image, image_data):
+                try:
+                    boundaries.add(SIGLIP_FEATURES[data].ids.index(prev_image["image"]))
+                except ValueError:
+                    pass
+        prev_image = image_data
+    return boundaries
+
+
+def create_new_segments(
+    data: Data, photo_ids: List[str], features: np.ndarray, blurred: Set[int]
+) -> List[Tuple[int, int]]:
+    print(f"Creating new segments for {data}, with {len(photo_ids)} photos...")
+    fixed_boundaries = get_fixed_boundaries(data)
+    # Segment the data
+    # sort features by the photo_ids
+    all_sims = []
+
+    for i in range(len(photo_ids) - 1):
+        j = i + 1
+        sim = features[i] @ features[j].T
+        all_sims.append(sim)
+
+    # Threshold for similarity
+    threshold = 0.0403
+
+    # Threshold for segment
+    threshold = np.percentile(all_sims, 80)
+
+    # Get segments from left to right
+    segments = []
+    start = 0
+    end = 1
+
+    while end < len(photo_ids) and start < len(photo_ids):
+        is_boundary = False
+        # check if the current segment is a fixed boundary
+        if end in fixed_boundaries:
+            is_boundary = True
+        else:
+            # try to see if the next image is similar
+            if (end - start) > 3 and end not in blurred:
+                sim_to_anchor = features[start] @ features[end].T
+                sim = all_sims[end - 1] + sim_to_anchor
+                sim = sim / 2
+                if sim < threshold:
+                    is_boundary = True
+
+        if is_boundary:
+            segments.append((start, end + 1))
+            start = end + 1
+            end = start + 1
+            continue
+        end += 1
+
+    if len(photo_ids) > 0 and start < len(photo_ids):
+        segments.append((start, len(photo_ids)))
+
+    # double check that all indices are in the segments
+    all_indices = set(range(len(photo_ids)))
+    all_used_indices = set()
+    for start, end in segments:
+        all_used_indices.update(set(range(start, end)))
+
+    if all_indices != all_used_indices:
+        rprint(f"[red]Warning: Not all indices are used in segments for {data}.[/red]")
+        print(
+            f"Used indices: {len(all_used_indices)}, Total indices: {len(all_indices)}"
+        )
+        unused_indices = all_indices - all_used_indices
+        print(f"Unused indices: {len(unused_indices)}")
+
+    return segments
+
+
+OVERWRITE_SEGMENTS = False  # Set to True to overwrite existing segments
+def load_segments(
+    data: Data,
+) -> Tuple[List[Tuple[int, int]], List[List[str]], Dict[str, int], List[Event]]:
+    try:
+        print(f"Loading segments for {data}...")
+        if data == Data.LSC23:
+            path = f"{CLIP_EMBEDDINGS}/{data}/google-siglip-so400m-patch14-384_nonorm"
+        else:
+            path = f"{CLIP_EMBEDDINGS}/{data}/siglip-so400m-patch14-384"
+        photo_ids = pd.read_csv(f"{path}/photo_ids.csv")["photo_id"].tolist()
+
+        segment_path = f"{DATA_DIRECTORY}/{data}_segments.json"
+        if not OVERWRITE_SEGMENTS and os.path.exists(segment_path):
+            segments = json.load(open(f"{DATA_DIRECTORY}/{data}_segments.json"))
+        else:
+            segments = create_new_segments(
+                data, photo_ids, np.load(f"{path}/features.npy"), blurred_indices[data]
+            )
+            # save segments to file
+            with open(segment_path, "w") as f:
+                json.dump(segments, f)
+
+        rprint(f"[green]Found {len(segments)} segments for {data}.[/green]")
+        segment_photos = []
+        photo_to_segment_id = {}
+        used = set()
+        print(segments[-1])
+        for segment_id, (start, end) in enumerate(segments):
+            segment_photos.append(photo_ids[start:end])
+            for photo_id in photo_ids[start:end]:
+                photo_to_segment_id[photo_id] = segment_id
+                used.add(photo_id)
+
+        # Check if all photo_ids are used
+        all_photo_ids = set(photo_ids)
+        if all_photo_ids != used:
+            rprint(
+                f"[orange]Warning: Not all photo IDs are used in segments for {data}.[/orange]"
+            )
+            unused_photos = all_photo_ids - used
+            print(f"Unused photo IDs: {len(unused_photos)}")
+
+        events = segments_to_events(data,
+            segments, [1] * len(segments), photo_ids,
+        )
+
+        return segments, segment_photos, photo_to_segment_id, events
+    except Exception as e:
+        print(f"Error loading segments for {data}: {e}")
+        return [], [], {}, []
+
+
+presegments = {data: load_segments(data) for data in [Data.LSC23, Data.Deakin]}
+
+
+def get_segments_from_top_photos(
+    top_photos: List[str],
+    scores: List[float],
+    segments: List[List[str]],
+    photo_to_segment_id: Dict[str, int],
+    blurred: Set[str],
+) -> Tuple[List[List[str]], List[float]]:
+    done = set()
+    found_segments = []
+    segment_scores = []
+
+    for photo_id, score in zip(top_photos, scores):
+        # # Test
+        # found_segments.append([photo_id])
+        # segment_scores.append(score)
+        # continue
+
+        # get the segment for the photo_id
+        segment_id = photo_to_segment_id.get(photo_id, None)
+        if segment_id is None:
+            print(f"Photo ID {photo_id} not found in photo_to_segment_id, skipping.")
+            continue
+        if segment_id in done:
+            continue
+        try:
+            segment = segments[segment_id]
+            segment = [photo for photo in segment if photo not in blurred]
+            found_segments.append(segment)
+            segment_scores.append(score)
+            done.add(segment_id)
+        except (KeyError, IndexError):
+            print(f"Photo ID {photo_id} not found in segments, skipping.")
+            continue
+
+    return found_segments, segment_scores
+
+
+@timer("merge_results")
+def merge_results(
+    all_scores, top_segment_ids, top_scores, photo_ids, segments, allow_none=True,
+    events: List[Event] = [],
+) -> Tuple[List[List[List[str]]], List[float]]:
+    print(f"Merging results for {len(top_segment_ids)} top segments...")
+    num_queries = len(all_scores)
+    *_, photo_to_segment_id, _ = presegments[Data.LSC23]
+
+    # Step 2: Group overlapping combinations
+    merged_groups = []
+    used = set()
+    to_check = "201905/12/20190512_050408_000.jpg"
+    to_check_id = photo_ids.index(to_check) if to_check in photo_ids else None
+    seg_to_check = photo_to_segment_id.get(to_check, None)
+    to_check_2 = "201905/11/20190511_180100_000.jpg"
+    to_check_2_id = photo_ids.index(to_check_2) if to_check_2 in photo_ids else None
+    seg_to_check_2 = photo_to_segment_id.get(to_check_2, None)
+
+    print("--" * 20)
+    print("All segments to check for", seg_to_check, seg_to_check_2)
+    to_checks = []
+    for i, combo in enumerate(top_segment_ids):
+        if seg_to_check is not None and seg_to_check in combo:
+            print(f"Segment {i} contains {to_check} ({to_check_id}). Segment: {combo}")
+            to_checks.append(i)
+        if seg_to_check_2 is not None and seg_to_check_2 in combo:
+            print(f"Segment {i} contains {to_check_2} ({to_check_2_id}). Segment: {combo}")
+            to_checks.append(i)
+
+    print("--" * 20)
+    print(f"Checking for overlaps with {to_check} ({to_check_id}) and {to_check_2} ({to_check_2_id})")
+    for i, combo in enumerate(top_segment_ids):
+        if i in used:
+            continue
+        group = [i]
+        used.add(i)
+        for j in range(i + 1, len(top_segment_ids)):
+            debug = i in to_checks or j in to_checks
+            if j in used:
+                continue
+            # if debug:
+                # print(f"Checking overlap between {i} and {j}: {combo} vs {top_segment_ids[j]}")
+
+            overlap_found = False
+            for s1, s2 in zip(combo, top_segment_ids[j]):
+                if s1 is None or s2 is None:
+                    continue
+                start1, end1 = segments[s1]
+                start2, end2 = segments[s2]
+                # event1 = events[s1] if s1 < len(events) else None
+                # event2 = events[s2] if s2 < len(events) else None
+
+                # if event1 is None or event2 is None:
+                #     continue
+
+                # if event1.location != event2.location:
+                #     continue
+
+                # if event1.start_time.date() != event2.start_time.date():
+                #     continue
+
+                # if to_check_id is not None and (
+                #     start1 <= to_check_id < end1 or
+                #     start2 <= to_check_id < end2
+                # ):
+                #     print("???")
+                #     print(combo, top_segment_ids[j])
+
+                if not (end1 <= start2 or end2 <= start1):
+                    overlap_found = True
+                    break
+
+
+            if overlap_found:
+                # If they are, we can merge them
+                group.append(j)
+                used.add(j)
+
+        merged_groups.append(group)
+
+    # Step 3: Collect segment IDs and photo IDs per query
+    merged_results = []  # List of N-length lists of photo IDs per query
+    merged_scores = []  # List of scores for each merged group
+
+    all_scores = np.array(all_scores)
+    for group in merged_groups:
+        per_query_segments = [[] for _ in range(num_queries)]
+
+        # Accumulate segment IDs per query, skipping None
+        for idx in group:
+            combo = top_segment_ids[idx]
+            for q in range(num_queries):
+                seg_id = combo[q]
+                if seg_id is not None:
+                    per_query_segments[q].append(seg_id)
+
+        # Deduplicate and sort by time
+        for q in range(num_queries):
+            per_query_segments[q] = sorted(
+                set(per_query_segments[q]), key=lambda sid: segments[sid][0]
+            )
+
+        # Convert segment IDs to photo IDs
+        per_query_photos = []
+        for q in range(num_queries):
+            seg_ids = per_query_segments[q]
+            photos = [photo_ids[i] for seg in seg_ids for i in range(*segments[seg])]
+            per_query_photos.append(photos)
+
+        if not allow_none and any(len(photos) == 0 for photos in per_query_photos):
+            continue
+
+        merged_results.append(per_query_photos)
+        merged_scores.append(np.max([top_scores[idx] for idx in group]))
+
+    # Step 4: Sort merged results by score
+    sorted_indices = np.argsort(-np.array(merged_scores))
+    merged_results = [merged_results[i] for i in sorted_indices]
+    merged_scores = [merged_scores[i] for i in sorted_indices]
+
+    print(f"Merged into {len(merged_results)} groups.")
+    return merged_results, merged_scores

@@ -4,55 +4,32 @@ import time
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-from configs import FILTER_FIELDS, MAX_IMAGES_PER_EVENT, MERGE_EVENTS
+from configs import FILTER_FIELDS, WINDOW_SIZE
 from database.main import get_db, group_collection, image_collection, scene_collection
 from database.models import GeneralRequestModel, Response
-from database.requests import get_es, get_request
+from database.requests import get_es, get_parsed_output, get_request
 from database.utils import get_relevant_fields, segments_to_events
 from fastapi import HTTPException
 from llm import llm_model
 from llm.prompts import ANSWER_MODEL_CHOOSING_PROMPT
 from pydantic import BaseModel, InstanceOf, RootModel
 from pympler import asizeof
-from query_parse.es_utils import get_conditional_time_filters, get_location_filters
-from query_parse.extract_info import (
-    Query,
-    create_es_combo_query,
-    create_es_query,
-    create_query,
-    modify_es_query,
-)
-from query_parse.question import (
-    detect_question,
-    question_classification,
-    question_to_retrieval,
-)
-from query_parse.types.elasticsearch import (
-    ESBoolQuery,
-    ESEmbedding,
-    ESFilter,
-    LocationInfo,
-    MSearchQuery,
-    TimeInfo,
-)
-from query_parse.types.lifelog import DateTuple, EatingFilters, Mode, TimeCondition
+from query_parse.extract_info import Query, modify_es_query
+from query_parse.question import detect_question, parse_query, question_classification
+from query_parse.types.elasticsearch import TimeInfo
+from query_parse.types.lifelog import DateTuple, EatingFilters, Mode, ParsedQuery
 from query_parse.types.options import FunctionWithArgs, SearchPipeline
 from query_parse.types.requests import (
     AnswerThisRequest,
     Data,
+    EditSearch,
     GeneralQueryRequest,
     MapRequest,
     Step,
     Task,
     TimelineDateRequest,
-)
-from query_parse.visual import (
-    encode_image,
-    encode_text,
-    get_model,
-    photo_ids,
 )
 from question_answering.text import answer_text_only, get_specific_description
 from question_answering.video import answer_visual_only, answer_visual_with_text
@@ -64,13 +41,14 @@ from results.models import (
     DerivedEvent,
     Event,
     EventResults,
-    GenericEventResults,
+    HeatmapResults,
     Image,
     PartialEvent,
     TimelineGroup,
     TimelineResult,
     TimelineScene,
     TripletEvent,
+    TripletEventResults,
 )
 from results.utils import (
     RelevantFields,
@@ -79,18 +57,26 @@ from results.utils import (
     merge_events,
 )
 from rich import print
+from visual import encode_text
+from visual.features import SIGLIP_FEATURES
+from visual.main import get_model
 
 from retrieval.async_utils import async_generator_timer, async_timer
-from retrieval.dynamic_segmentation import get_keyframes_from_segments, get_segments, get_segments_2
-from retrieval.graph_utils import get_deakin_heatmap_per_hours, get_heatmap_data
+from retrieval.dynamic_segmentation import (
+    get_keyframes_from_segments,
+    get_segments_related_to_text,
+)
+from retrieval.graph_utils import get_heatmap_data
+from retrieval.lsc25 import (
+    get_segments_from_similarity_scores,
+    lsc25_get_segments,
+    lsc25_multi_queries,
+)
 from retrieval.search_utils import (
     get_raw_search_results,
-    get_search_function,
     get_search_request,
-    merge_msearch_with_main_results,
     organize_by_relevant_fields,
     process_search_results,
-    send_multiple_search_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,16 +108,20 @@ async def streaming_manager(request: GeneralQueryRequest) -> AsyncGenerator[str,
                 if response.type in ["images", "modified"]:
                     res = [
                         TripletEvent.model_validate(event)
-                        for event in response.response.events
+                        for event in response.response
                     ]
-                    response.response.events = res
+                    response.response = res
+                if response.type == "heatmap":
+                    res = [
+                        HeatmapResults.model_validate(heatmap)
+                        for heatmap in response.response
+                    ]
+                    response.response = res
                 response.oid = req.oid
                 data = response.model_dump_json(by_alias=True)
                 yield f"data: {data}\n\n"
         else:
-            search_function = get_search_function(
-                request, single_query, two_queries, request.task_type
-            )
+            search_function = perform_full_search(request)
             async for response in search_function:
                 # Save the response
                 response.oid = cached_responses.oid
@@ -171,19 +161,65 @@ async def streaming_manager(request: GeneralQueryRequest) -> AsyncGenerator[str,
 # ============================= #
 @async_timer("simple_search")
 async def simple_search(
-    main_query: ESBoolQuery,
+    query: ParsedQuery,
     data: Data,
     size: int,
     tag: str = "",
     mode: Mode = Mode.event,
-) -> AsyncioTaskResult[EventResults]:
+    edit_search: Optional[EditSearch] = None,
+) -> AsyncioTaskResult[TripletEventResults]:
     """
     Search a single query without any fancy stuff
     """
-    request = get_search_request(main_query, size, mode)
     results = None
+    if query.multiple_queries:
+        print("[green]Multiple queries found[/green]")
+        segment_res = await lsc25_multi_queries(
+            query,
+            data,
+            window_size=edit_search.window_size if edit_search else WINDOW_SIZE,
+        )
 
-    # test
+    else:
+        segment_res = await lsc25_get_segments(
+            query.main,
+            data,
+            top_n=size,
+        )
+
+    events = segment_res.events
+
+    print("[green]Events found[/green]", len(events))
+    results = TripletEventResults(
+        events=events, scores=segment_res.segment_scores[:size]
+    )
+
+    # The scores are on a x-axis of time
+    # We can visualize the scores in a heatmap like git commit history
+    # of the scores
+    visualisation_data = get_heatmap_data(
+        data, segment_res.scores, segment_res.high_score_indices
+    )
+    # filter_fields = main_query.filters
+    # if filter_fields and filter_fields.patient_id:
+    #     visualisation_data.extend(
+    #         get_deakin_heatmap_per_hours(
+    #             data,
+    #             segment_res.scores,
+    #             segment_res.high_score_indices,
+    #             filter_fields.patient_id,
+    #         )
+    #     )
+
+    # Give some label to the results
+    if results:
+        print(f"[green]Found {len(results.events)} matches for {mode}[/green]")
+        results = create_event_label(data, results)
+        results.heatmap = visualisation_data
+    return AsyncioTaskResult(task_type="search", tag=tag, results=results)
+
+
+def search_metadata(data, request):
     db = get_db(data)
     mongo_query = request.mongo_match
     mongo_scores = {}
@@ -194,10 +230,10 @@ async def simple_search(
                 **mongo_query["filters"],
                 **mongo_query["must_not"],
             }
-            print("[green]Filter Mongo Query[/green]", find_query)
+            # print("[green]Filter Mongo Query[/green]", find_query)
             image_cursor = image_collection(db).find(find_query, {"image": 1})
             images = {doc["image"] for doc in image_cursor}
-            print("[green]Filtered images found[/green]", len(images))
+            # print("[green]Filtered images found[/green]", len(images))
 
         if mongo_query["scores"]:
             try:
@@ -205,8 +241,7 @@ async def simple_search(
                     **mongo_query["scores"],
                     **mongo_query["filters"],
                 }
-                print("[green]Score Mongo Query[/green]", find_query)
-
+                # print("[green]Score Mongo Query[/green]", find_query)
                 image_cursor = image_collection(db).find(
                     find_query, {"image": 1, "score": {"$meta": "textScore"}}
                 )
@@ -215,66 +250,12 @@ async def simple_search(
                 print("[green]Images with scores found[/green]", len(mongo_scores))
             except Exception as e:
                 print("[red]Error in getting scores[/red]", e)
-
-    segment_res = get_segments(
-        main_query.query,
-        data,
-        max_gap=5,
-        filters=images,
-        metadata_scores=mongo_scores,
-    )
-    if not segment_res["segments"]:
-        print("[red]No segments found[/red]")
-        return AsyncioTaskResult(task_type="search", tag=tag, results=results)
-
-    print("[green]Total segments found[/green]", len(segment_res["segments"]))
-
-    events = segments_to_events(
-        data,
-        segment_res["segments"][:size],
-        segment_res["segment_scores"][:size],
-        photo_ids(data),
-    )
-
-    print("[green]Events found[/green]", len(events))
-    es_results = EventResults(
-        events=events, scores=segment_res["segment_scores"][:size]
-    )
-
-    # The scores are on a x-axis of time
-    # We can visualize the scores in a heatmap like git commit history
-    # of the scores
-    visualisation_data = get_heatmap_data(
-        data, segment_res["scores"], segment_res["high_score_indices"]
-    )
-    filter_fields = main_query.filters
-    if filter_fields and filter_fields.patient_id:
-        visualisation_data.extend(
-            get_deakin_heatmap_per_hours(
-                data,
-                segment_res["scores"],
-                segment_res["high_score_indices"],
-                filter_fields.patient_id,
-            )
-        )
-
-    # # end test
-    # es_response = await send_search_request(request)
-    # es_results = process_es_results(main_query.query, es_response, mode=mode)
-
-    # Give some label to the results
-    if es_results:
-        print(f"[green]Found {len(es_results.events)} matches for {mode}[/green]")
-        es_results.min_score = main_query.min_score
-        es_results.max_score = main_query.max_score
-        results = create_event_label(data, es_results)
-        results.heatmap = visualisation_data
-    return AsyncioTaskResult(task_type="search", tag=tag, results=results)
+    return images, mongo_scores
 
 
 def get_segments_only(
     main_text: str, filters: EatingFilters, data: Data
-) -> Tuple[List[Event], int, List[bool]]:
+) -> Tuple[List[Event], int, List[bool], HeatmapResults | None]:
     """
     Get the segments only
     """
@@ -291,17 +272,21 @@ def get_segments_only(
     images = [doc["image"] for doc in images_cursor]
     first_image = images[0] if images else None
     last_image = images[-1] if images else None
+    if not first_image or not last_image:
+        print("[red]No images found in the database[/red]")
+        return [], 0, [], None
+
     images = set(images)
-    first_index = photo_ids(data).index(first_image)
-    last_index = photo_ids(data).index(last_image)
+    first_index = SIGLIP_FEATURES[data].ids.index(first_image)
+    last_index = SIGLIP_FEATURES[data].ids.index(last_image)
 
     if len(images) == 0:
         print("[red]No images found[/red]")
-        return [], 0, []
+        return [], 0, [], None
 
     print("[green]Images found[/green]", len(images))
     # segment_res = get_segments(main_text, data, max_gap=5, filters=images, to_merge=True)
-    segment_res = get_segments_2(main_text, data, filters=images)
+    segment_res = get_segments_related_to_text(main_text, data, filters=images)
     eating = []
     if not segment_res["segments"]:
         print("[red]No segments found[/red]")
@@ -332,6 +317,7 @@ def get_segments_only(
             eating.append(True)
             i += 1
             first_index = end
+
         if first_index < last_index:
             all_segments.append((first_index, last_index))
             all_scores.append(-1)
@@ -346,10 +332,10 @@ def get_segments_only(
         data,
         all_segments,
         all_scores,
-        photo_ids(data),
+        SIGLIP_FEATURES[data].ids,
     )
     print("[green]Events found[/green]", len(events))
-    return events, len(images), eating
+    return events, len(images), eating, segment_res["heatmap"]
 
 
 class AnswerModel(BaseModel):
@@ -364,30 +350,8 @@ class AnswerModelOption(RootModel):
         return self.root.get(key, default)
 
 
-from contextlib import asynccontextmanager
-
-
 class RetryException(Exception):
     pass
-
-
-@asynccontextmanager
-async def try_until_success(times: int = 3):
-    tries = 0
-    try:
-        while tries < times:
-            try:
-                yield
-                break
-            except Exception as e:
-                tries += 1
-                if tries == times:
-                    raise RetryException(f"Failed after {times} tries") from e
-                await asyncio.sleep(0)
-    except RetryException as e:
-        pass
-    finally:
-        pass
 
 
 async def get_answer_models(question: str) -> AnswerModelOption:
@@ -414,17 +378,19 @@ async def get_answer_models(question: str) -> AnswerModelOption:
 
 
 @async_generator_timer("single_query")
-async def single_query(
-    text: str,
-    filters: EatingFilters,
-    data: Data,
-    pipeline: Optional[SearchPipeline] = None,
-    task_type: Task = Task.NONE,
+async def perform_full_search(
+    request: GeneralQueryRequest,
 ):
     """
     Search (and answer) a single query
     """
     now = time.time()
+    text: str = request.main
+    filters: EatingFilters = request.filters or EatingFilters()
+    data: Data = request.data or Data.LSC23
+    pipeline: Optional[SearchPipeline] = request.pipeline
+    task_type: Task = request.task_type or Task.NONE
+    edit_search = request.edit_search
 
     if not pipeline:
         pipeline = SearchPipeline()
@@ -433,42 +399,47 @@ async def single_query(
     # ============================= #
     # 1. Query Parser (no skipping but modifiable)
     # ============================= #
-    output = await pipeline.query_parser.async_execute(
-        [
-            FunctionWithArgs(
-                function=detect_question, args=[text], output_name="is_question"
-            ),
-            FunctionWithArgs(
-                function=question_to_retrieval,
-                args=[text],
-                use_previous_output=True,
-                output_name="search_text",
-                is_async=True,
-            ),
-            FunctionWithArgs(
-                function=create_query,
-                kwargs={"filters": filters, "data": data},
-                use_previous_output=True,
-                output_name="query",
-                is_async=True,
-            ),
-            FunctionWithArgs(  # no skipping
-                function=create_es_combo_query,
-                use_previous_output=True,
-                kwargs={"ignore_limit_score": True},
-                output_name="es_query",
-                is_async=True,
-            ),
-        ]
-    )
+    if pipeline.query_parser.executed:
+        output = pipeline.query_parser.output
+    else:
+        parsed = get_parsed_output(text, data)
+        output = None
+        if parsed:
+            for response in parsed["responses"]:
+                if response["type"] == "pipeline":
+                    response = response["response"]
+                    parsed_pipeline = SearchPipeline.model_validate(response)
+                    parsed_output = parsed_pipeline.query_parser.output
+                    output = {
+                        "query": ParsedQuery.model_validate(parsed_output),
+                        "is_question": parsed_output["isQuestion"],
+                    }
+                    print("[green]Using cached query parser output[/green]")
+                    break
+        if not output:
+            output = await pipeline.query_parser.async_execute(
+                [
+                    FunctionWithArgs(
+                        function=detect_question, args=[text], output_name="is_question"
+                    ),
+                    FunctionWithArgs(
+                        function=parse_query,
+                        kwargs={"text": text, "eating_filters": filters},
+                        use_previous_output=True,
+                        output_name="query",  # ParsedQuery
+                        is_async=True,
+                    ),
+                ]
+            )
 
     print("--> Query Parser", time.time() - now)
-
     if output["is_question"]:
         step.total = 4
 
-    configs = output["query"].print_info()
+    configs = output["query"].model_dump()
     pipeline.query_parser.add_output(configs)
+    pipeline.multiple_queries = output["query"].multiple_queries
+    pipeline.window_size = edit_search.window_size if edit_search else WINDOW_SIZE
 
     # ============================= #
     # 2. Search (Field extractor can be skipped)
@@ -477,12 +448,13 @@ async def single_query(
     field_extractor = pipeline.field_extractor
     skip_extract = task_type == Task.AD_HOC
     async_tasks = get_search_tasks(
-        output["es_query"],
+        output["query"],
         pipeline.size,
         text,
         data,
-        tag="single",
+        tag="multiple" if output["query"].multiple_queries else "single",
         filter_fields=not skip_extract,
+        edit_search=edit_search,
     )
 
     # ----------------------------- #
@@ -500,7 +472,7 @@ async def single_query(
                 type="images",
                 response=process_search_results(results),
                 progress=step.progress(),
-                es_id=output["query"].oid,
+                # es_id=output["query"].oid,
             )
             if results and results.heatmap:
                 yield Response(
@@ -542,7 +514,7 @@ async def single_query(
             FunctionWithArgs(
                 function=merge_events,
                 args=[
-                    f"query: {text}, visual: {output['search_text']}",
+                    f"query: {text}",
                     data,
                     results,
                     relevant_fields,
@@ -581,6 +553,14 @@ async def single_query(
     )
     if not unchanged:
         print("[blue]Some changes detected[/blue]")
+        # get keyframes from segments
+        encoded_query = encode_text(text)
+        for event in results.events:
+            if not event.main.keyframes:
+                event.main.keyframes = get_keyframes_from_segments(
+                    encoded_query, data, event.main.images
+                )
+
         results = create_event_label(data, results, relevant_fields.relevant_fields)
 
     step.step += 1
@@ -620,16 +600,19 @@ async def single_query(
 
 
 def get_search_tasks(
-    main_query: ESBoolQuery,
+    query: ParsedQuery,
     size: int,
     text: str,
     data: Data,
     tag: str = "",
     filter_fields: bool = FILTER_FIELDS,
+    edit_search: Optional[EditSearch] = None,
 ) -> List[asyncio.Task]:
     tasks = []
 
-    tasks.append(simple_search(main_query, data, size, tag, mode=Mode.event))
+    tasks.append(
+        simple_search(query, data, size, tag, mode=Mode.event, edit_search=edit_search)
+    )
     if filter_fields and text:
         tasks.append(get_relevant_fields(text, tag))
 
@@ -640,7 +623,7 @@ def get_search_tasks(
 
 async def get_answer_tasks(
     text: str,
-    results: EventResults,
+    results: TripletEventResults,
     relevant_fields: List[str],
 ) -> AsyncGenerator[List[AnswerResult], None]:
     question_type = await question_classification(text)
@@ -664,7 +647,9 @@ async def get_answer_tasks(
 
     textual_descriptions = []
     for event in results.events[:k]:
-        textual_descriptions.append(get_specific_description(event, relevant_fields))
+        textual_descriptions.append(
+            get_specific_description(event.main, relevant_fields)
+        )
 
     if not textual_descriptions:
         print(f"[red]No textual descriptions found for k={k}[/red]")
@@ -685,250 +670,6 @@ async def get_answer_tasks(
             yield answers
 
 
-# ============================= #
-# Level 2: Two queries
-# ============================= #
-async def add_conditional_filters_to_query(
-    conditional_query: Query,
-    main_results: EventResults,
-    condition: TimeCondition,
-) -> MSearchQuery:
-    """
-    Add the conditional filters to the query
-    """
-    es_query = await create_es_query(conditional_query)
-    filters = get_conditional_time_filters(main_results, condition)
-
-    msearch_queries = []
-    for cond_filter in filters:
-        clone_query = es_query.model_copy(deep=True)
-        clone_query.filter.append(cond_filter)
-        msearch_queries.append(clone_query)
-
-    return MSearchQuery(queries=msearch_queries)
-
-
-async def two_queries(
-    main_text: str,
-    conditional_text: str,
-    condition: TimeCondition,
-    size: int,
-    data: Data,
-):
-    """
-    Search for two related queries based on the time condition
-    """
-    is_question = detect_question(main_text)
-    if is_question:
-        search_text = await question_to_retrieval(main_text, is_question)
-    else:
-        search_text = main_text
-
-    query = await create_query(search_text, is_question, data)
-    es_query = await create_es_combo_query(query, ignore_limit_score=False)
-    conditional = await create_query(conditional_text, is_question, data)
-    conditional_es_query = await create_es_combo_query(
-        conditional, ignore_limit_score=False
-    )
-
-    tasks = get_search_tasks(es_query, size, main_text, data, tag="main")
-    tasks += get_search_tasks(
-        conditional_es_query, size, conditional_text, data, tag="conditional"
-    )
-
-    # Starting the async tasks
-    main_results, conditional_results, relevant_fields, conditional_relevant_fields = (
-        None,
-        None,
-        None,
-        None,
-    )
-    main_query, conditional_query = None, None
-
-    for future in asyncio.as_completed(tasks):
-        res: AsyncioTaskResult = await future
-        task = res.task_type
-        tag = res.tag
-
-        if task == "search":
-            assert isinstance(
-                res.results, GenericEventResults
-            ), "Results should be EventResults"
-            if tag == "main":
-                main_results = res.results
-            elif tag == "conditional":
-                conditional_results = res.results
-        elif task == "llm":
-            if tag == "main":
-                relevant_fields = res.results
-            elif tag == "conditional":
-                conditional_relevant_fields = res.results
-
-    if (
-        main_results is None
-        or conditional_results is None
-        or conditional_query is None
-        or main_query is None
-    ):
-        print("[red]two queries: No results found[/red]")
-        return
-
-    # Add the conditional filters
-    msearch_query = await add_conditional_filters_to_query(
-        conditional_query, main_results, condition
-    )
-
-    # Send the search request
-    print("[green]Sending the multi-search request...[/green]")
-    msearch_results = await send_multiple_search_request(data, msearch_query)
-
-    if not msearch_results:
-        print("[red]two queries - msearch: No results found[/red]")
-        return
-
-    # Merge the two results
-    merged_results = merge_msearch_with_main_results(
-        main_results, msearch_results, condition
-    )
-    print("[green]Merged results[/green]", len(merged_results.events))
-    yield {"type": "raw", "results": merged_results}
-
-    # ============================= #
-    # Processing...
-    # ============================= #
-    def apply_msearch(func: Callable, *args, **kwargs):
-        return [func(res, *args, **kwargs) if res else None for res in msearch_results]
-
-    changed = False
-    if FILTER_FIELDS:
-        if main_text and relevant_fields:
-            main_results = organize_by_relevant_fields(main_results, relevant_fields)
-        # if conditional_text and conditional_relevant_fields:
-        #     conditional_results = organize_by_relevant_fields(
-        #         conditional_results, conditional_relevant_fields
-        #     )
-        msearch_results = apply_msearch(
-            organize_by_relevant_fields, conditional_relevant_fields
-        )
-        changed = True
-
-    if MERGE_EVENTS:
-        main_results = merge_events(
-            main_text, data, main_results
-        )  # TODO! add the relevant fields
-        # conditional_results = merge_events(conditional_results)
-        msearch_results = apply_msearch(merge_events)
-        changed = True
-
-    if MAX_IMAGES_PER_EVENT:
-        print(f"[blue]Limiting images to {MAX_IMAGES_PER_EVENT}[/blue]")
-        main_results = limit_images_per_event(
-            main_results, main_text, MAX_IMAGES_PER_EVENT
-        )
-        # conditional_results = limit_images_per_event(
-        #     conditional_results, conditional_text, MAX_IMAGES_PER_EVENT
-        # )
-        msearch_results = apply_msearch(
-            limit_images_per_event, conditional_text, MAX_IMAGES_PER_EVENT
-        )
-        changed = True
-
-    if changed:
-        merged_results = merge_msearch_with_main_results(
-            main_results, msearch_results, condition
-        )
-        # Give a different label:
-        merged_results = create_event_label(data, merged_results)
-        # Send the modified results
-        yield {"type": "modified", "results": merged_results}
-
-    # Answer the question
-    if not is_question:
-        return
-    print("[yellow]Answering the question...[/yellow]")
-    k = min(10, len(merged_results.events))
-    textual_descriptions = []
-    if main_results.relevant_fields or conditional_results.relevant_fields:
-        for event in merged_results.events[:k]:
-            main_description = get_specific_description(
-                event.main, main_results.relevant_fields
-            )
-            conditional_description = get_specific_description(
-                event.conditional, conditional_results.relevant_fields
-            )
-            textual_descriptions.append(
-                f"{main_description}. About {condition.time_limit_str} {condition.condition} that, {conditional_description}"
-            )
-    if not textual_descriptions:
-        return
-    print("[green]Textual description sample[/green]", textual_descriptions[0])
-
-    all_answers: AnswerListResult = AnswerListResult()
-
-    async for new_answers in get_answer_tasks(
-        main_text, main_results, main_results.relevant_fields
-    ):
-        for answer in new_answers:
-            all_answers.add_answer(answer)
-        yield {"type": "answers", "answers": all_answers}
-
-
-@async_timer("search_location_again")
-async def search_location_again(request: MapRequest) -> Optional[List[Event]]:
-    query_doc = get_es(request.es_id)
-    if not query_doc:
-        print("[red]Query not found[/red]")
-        return []
-
-    query_doc["oid"] = query_doc.pop("_id")
-    query = Query.model_validate(query_doc)
-    print("OLD Query", query)
-    print("-" * 50)
-    location, center = request.location, request.center
-    ids = []
-    filters = []
-    location_info = None
-
-    if location and location != "---":
-        print("Location", location)
-        print("Center", center)
-        location = location.lower()
-        location_info = LocationInfo(locations=[location], from_center=center)
-        location_filters, *_ = get_location_filters(location_info)
-        filters = [location_filters]
-
-    if request.image:
-        # get scene
-        image = request.image
-        doc = image_collection(get_db(request.data)).find_one({"image": image})
-        if doc:
-            scene = doc["scene"]
-            ids.append(ESFilter(name="SCENE", field="scene", value=scene))
-    if request.scene:
-        ids.append(ESFilter(name="SCENE", field="scene", value=request.scene))
-    if request.group:
-        ids.append(ESFilter(name="GROUP", field="group", value=request.group))
-
-    # Modify the query
-    new_query = await modify_es_query(
-        query,
-        location=location_info,
-        extra_filters=filters + ids,
-        extra_shoulds=ids,
-        mode=Mode.event,
-        overwrite=True,
-    )
-    if new_query:
-        print("New Query", new_query)
-        results = await simple_search(
-            new_query, size=20, data=request.data, tag="location"
-        )
-        if results.results:
-            return results.results.events
-    print("[red]search_location_again: No results found[/red]")
-    return []
-
-
 @async_timer("search_from_location")
 async def search_from_location(
     request: MapRequest,
@@ -939,13 +680,13 @@ async def search_from_location(
     # Do another search with different location filter
     if request.es_id:
         print("[green]Searching from location again...[/green]")
-        return await search_location_again(request)
+        # return await search_location_again(request)
 
     # Just filter the results based on the location
     # Find main cached request with oid
     main_request = get_request(request.oid)
     if not main_request:
-        print("[red]Main request not found[/red]")
+        print(f"[red]Main request not found for oid {request.oid}[/red]")
         raise HTTPException(status_code=404, detail="I don't know how you got here")
 
     # Filter the results based on the location
@@ -1062,20 +803,30 @@ async def search_similar_events(image: str, data: Data) -> Optional[EventResults
     """
     Search for similar events
     """
-    image_feat = encode_image(image, get_model(data))
-    if not image_feat:
-        return None
+    model = get_model(data)
+    similarity = model.find_similar_images(image, data)
+    print("[green]Similarity scores found[/green]", similarity.shape)
 
-    # Find the similar events
-    es = ESBoolQuery()
-    es.must.append(ESEmbedding(embedding=image_feat.tolist(), text=""))
+    segment_result = get_segments_from_similarity_scores(similarity, data=data)
 
-    result = await simple_search(es, size=200, data=data, tag="similar")
-    if not result.results or not result.results.events:
+    result = TripletEventResults(
+        events=segment_result.events,
+        scores=segment_result.segment_scores,
+    )
+
+    if not result.events:
         print("[red]No similar events found[/red]")
         return None
 
-    return result.results
+    print("[green]Found similar events[/green]", len(result.events))
+    # create labels for the events
+    result = create_event_label(data, result)
+
+    result.heatmap = get_heatmap_data(
+        data, segment_result.scores, segment_result.high_score_indices
+    )
+
+    return result
 
 
 @async_generator_timer("answer_single_event")
@@ -1087,7 +838,6 @@ async def answer_single_event(
     Answer the question for a single event
     """
     db = get_db(data)
-    image = request.image
 
     # Get scene information from the image
     scene = scene_collection(db).find_one(
@@ -1102,23 +852,6 @@ async def answer_single_event(
     textual_description = get_specific_description(event, request.relevant_fields)
 
     images = [Image(**x) for x in scene["images"]]
-    this_image = [x for x in images if x.src == image][0]
-
-    # Get up to 9 highest scoring images
-    if len(event.images) > 1:
-        other_images = [x for x in event.images if x.src != image]
-        encoded_query = encode_text(request.question, chosen_model=get_model(data))
-        # visual_scores = score_images(
-        #     other_images, encoded_query, data, chosen_model=get_model(data)
-        # )
-        # sorted_images = sorted(
-        #     zip(other_images, visual_scores), key=lambda x: x[1], reverse=True
-        # )
-        # images = [this_image] + [x[0] for x in sorted_images[:8]]
-        keyframes = get_keyframes_from_segments(encoded_query, data, other_images)
-        images = [this_image] + keyframes
-    else:
-        images = [this_image]
 
     async for answers in answer_visual_with_text(
         request.question, images, textual_description

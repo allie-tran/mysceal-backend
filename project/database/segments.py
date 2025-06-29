@@ -1,13 +1,13 @@
-from typing import List
+from typing import List, Optional
 
 from llm import vllm_model
 from llm.models import MixedContent
 from myeachtra.dependencies import CamelCaseModel
 from query_parse.types.requests import Data
-from query_parse.visual import get_model
 from question_answering.video import get_openai_visual_message
-from results.models import Image
+from results.models import HeatmapResults, Image
 from rich import print as rprint
+from visual.main import encode_text
 
 from database.main import get_db
 from retrieval.dynamic_segmentation import get_keyframes_from_segments
@@ -36,9 +36,11 @@ class EventSegments(CamelCaseModel):
     segments: List[EventSegment] = []
     count: int = 0
     manually_checked: bool = False
+    heatmap: Optional[HeatmapResults] = None
 
 
-def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = False):
+def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = False
+                        ):
     """
     Save segments to the database
     """
@@ -48,7 +50,7 @@ def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = 
         segments = merge_segments(segments)
 
     # update keyframes
-    encoded_query = get_model(data).encode_text("I am eating or interacting with food")
+    encoded_query = encode_text("I am eating or interacting with food")
     for segment in segments.segments:
         if not segment.keyframes:
             segment.keyframes = get_keyframes_from_segments(encoded_query, data, segment.images)
@@ -57,6 +59,7 @@ def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = 
         {
             "patient_id": segments.patient_id,
             "date": segments.date,
+
         },
         {"$set": segments.model_dump()},
         upsert=True,
@@ -176,7 +179,7 @@ Leave the annotation blank if it is not possible to determine the annotation fro
 """,
             )
         ]
-        encoded_query = get_model(data).encode_text("I am eating or interacting with food")
+        encoded_query = encode_text("I am eating or interacting with food")
         images = get_keyframes_from_segments(encoded_query, data, segment.images)
         # split the images into smaller chunks (max 9 images per chunk)
         max_images_per_chunk = 4

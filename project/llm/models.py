@@ -17,10 +17,10 @@ from openai.types.chat import (
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from partialjson.json_parser import JSONParser
 from pyrate_limiter import BucketFullException, Duration, Limiter, Rate
+from retrieval.async_utils import async_generator_timer
 from rich import print
 
 from llm.prompts import INSTRUCTIONS
-from retrieval.async_utils import async_generator_timer
 
 parser = JSONParser()
 parser.on_extra_token = lambda *_, **__: None
@@ -30,7 +30,12 @@ limiter = Limiter(rate)
 
 # Set up ChatGPT generation model
 OPENAI_API = os.environ.get("OPENAI_API", "")
-MODEL_NAME = os.environ.get("MODEL_NAME", "")
+# MODEL_NAME = os.environ.get("MODEL_NAME", "")
+# MODEL_NAME = "gpt-4o-mini"  # Default to a specific model if not set
+# MODEL_NAME = "gpt-4.1-nano-2025-04-14"
+MODEL_NAME = "gpt-4.1-mini-2025-04-14"
+# MODEL_NAME = "gpt-4o"
+SEARCH_MODEL_NAME = "gpt-4o-mini-search-preview"
 
 
 class MixedContent(BaseModel):
@@ -48,12 +53,12 @@ class LLM:
         self.client = AsyncOpenAI(api_key=OPENAI_API)
         self.model_name = MODEL_NAME
 
-    async def generate(self, messages: List[ChatCompletionMessageParam]):  # type: ignore
+    async def generate(self, messages: List[ChatCompletionMessageParam], model: str | None = None):  # type: ignore
         """
         Generate completions from a list of messages
         """
         request = await self.client.chat.completions.create(
-            model=self.model_name, messages=messages, stream=True
+            model=model or self.model_name, messages=messages, stream=True
         )
 
         async for chunk in request:
@@ -77,9 +82,22 @@ class LLM:
                 yield json_object
             except json.JSONDecodeError:
                 pass
+        # if there is no JSON_START_FLAG, we return the response as is
+        response = response.strip()
+        if response:
+            try:
+                json_object = parser.parse(response)
+                yield json_object
+            except json.JSONDecodeError:
+                print("Error parsing object")
+                print("[ERROR]", response)
+                pass
 
     async def __generate_and_parse(
-        self, messages: List[ChatCompletionMessageParam], stream=False
+        self,
+        messages: List[ChatCompletionMessageParam],
+        stream=False,
+        model: str | None = None,
     ) -> AsyncGenerator[Dict, None]:
         """
         Generate completions from a list of messages
@@ -90,7 +108,7 @@ class LLM:
         if DEBUG:
             print("Generating completions...")
 
-        async for completion in self.generate(messages):
+        async for completion in self.generate(messages, model=model):
             res += completion
             response = res
             await asyncio.sleep(0)
@@ -123,9 +141,15 @@ class LLM:
                 print("[ERROR]", obj)
                 pass
 
+        if not all_objects:
+            print("[red]No JSON object found in the response.[/red]")
+            print(res)
+
         yield all_objects
 
-    async def generate_from_text(self, text: str) -> Optional[Dict]:
+    async def generate_from_text(
+        self, text: str, model: str | None = None
+    ) -> Optional[Dict]:
         """
         Generate completions from text
         Then parse the JSON object from the completion
@@ -134,12 +158,14 @@ class LLM:
         messages = [self.template_message]
         messages.append(ChatCompletionUserMessageParam(role="user", content=text))
         res = None
-        async for data in self.__generate_and_parse(messages):
+        async for data in self.__generate_and_parse(messages, stream=False, model=model):
             await asyncio.sleep(0)
             res = data
         return res
 
-    async def stream_from_text(self, text: str) -> AsyncGenerator[Dict, None]:
+    async def stream_from_text(
+        self, text: str, model: str | None = None
+    ) -> AsyncGenerator[Dict, None]:
         """
         Generate completions from text
         Then parse the JSON object from the completion
@@ -147,11 +173,13 @@ class LLM:
         """
         messages = [self.template_message]
         messages.append(ChatCompletionUserMessageParam(role="user", content=text))
-        async for data in self.__generate_and_parse(messages, stream=True):
+        async for data in self.__generate_and_parse(messages, stream=True, model=model):
             yield data
 
     @async_generator_timer("generate_from_mixed_media")
-    async def generate_from_mixed_media(self, data: Sequence[MixedContent])-> AsyncGenerator[Dict, None]:
+    async def generate_from_mixed_media(
+        self, data: Sequence[MixedContent]
+    ) -> AsyncGenerator[Dict, None]:
         messages = [self.template_message]
         content: List[ChatCompletionContentPartParam] = []
         for part in data:

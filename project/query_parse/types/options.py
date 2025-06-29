@@ -9,6 +9,7 @@ from configs import (
     MAXIMUM_EVENT_TO_GROUP,
     MERGE_EVENTS,
     QUERY_PARSER,
+    WINDOW_SIZE,
 )
 from pydantic import Field, model_validator
 from myeachtra.dependencies import CamelCaseModel
@@ -236,6 +237,9 @@ class SearchPipeline(CamelCaseModel):
         exclude_output=["results"],
         output={"max_images": MAX_IMAGES_PER_EVENT},
     )
+
+    multiple_queries: bool = False
+    window_size: int = WINDOW_SIZE
 
     def export(
         self,

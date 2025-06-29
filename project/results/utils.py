@@ -14,12 +14,12 @@ from database.main import get_db, image_collection, scene_collection
 from pydantic import BaseModel, InstanceOf, validate_call
 from query_parse.types.lifelog import MaxGap, RelevantFields
 from query_parse.types.requests import Data
-from query_parse.visual import get_model, score_images
+from visual.main import get_model, score_images
 from retrieval.dynamic_segmentation import get_keyframes_from_segments
 from retrieval.rerank import reranker
 from rich import print
 
-from results.models import Event, EventResults, GenericEventResults, Image
+from results.models import Event, EventResults, GenericEventResults, Image, TripletEvent, TripletEventResults
 
 
 def deriving_fields(
@@ -202,9 +202,9 @@ def custom_compare_function(
 def merge_events(
     text: str,
     data: Data,
-    results: EventResults,
+    results: TripletEventResults,
     relevant_fields: RelevantFields = RelevantFields(),
-) -> EventResults:
+) -> TripletEventResults:
     """
     Merge the events
     """
@@ -232,7 +232,12 @@ def merge_events(
 
     # Derive the fields
     if derive_fields:
-        results.events = deriving_fields(results.events, derive_fields)
+        events = [event.main for event in results.events]
+        events = deriving_fields(events, derive_fields, data)
+        # Replace the main events with the derived events
+        for i, event in enumerate(results.events):
+            event.main = events[i]
+        # results.events = deriving_fields(results.events, derive_fields)
 
     if len(results.events) == 1:
         return results
@@ -247,30 +252,30 @@ def merge_events(
 
     # Group the events using the ISEQUAL criteria from configs
     unique_groups = 0
-    events = results.events
     scores = results.scores
-    grouped_events = {0: [events[0]]}
+    triplet_events = results.events
+    grouped_events = {0: [triplet_events[0]]}
     grouped_scores = {0: [scores[0]]}
 
-    print(f"[blue]Grouping {len(events)} events by {groupby}[/blue]")
-    for event, score in zip(events[1:], scores[1:]):
+    print(f"[blue]Grouping {len(triplet_events)} events by {groupby}[/blue]")
+    for triplet_event, score in zip(triplet_events[1:], scores[1:]):
         found = False
         for group in grouped_events:
-            if cmp(event, grouped_events[group][0]) == 0:
+            if cmp(triplet_event.main, grouped_events[group][0].main) == 0:
                 found = True
                 if len(grouped_events[group]) < MAXIMUM_EVENT_TO_GROUP:
-                    grouped_events[group].append(event)
+                    grouped_events[group].append(triplet_event)
                     grouped_scores[group].append(score)
                 break
         if not found:
             # No existing group found
             unique_groups += 1
-            grouped_events[unique_groups] = [event]
+            grouped_events[unique_groups] = [triplet_event]
             grouped_scores[unique_groups] = [score]
     print(f"[blue]{unique_groups + 1} unique groups[/blue]")
 
-    new_results = []
-    new_scores = []
+    new_results: List[TripletEvent] = []
+    new_scores: List[float] = []
     for group in grouped_events:
         # Merge the events
         events = grouped_events[group]
@@ -284,43 +289,69 @@ def merge_events(
         new_event = events[0]
         to_merge = events[1:]
         to_merge_scores = scores[1:]
+        new_event.main.merge_with_many(scores[0], [e.main for e in to_merge], to_merge_scores)
 
-        new_event.merge_with_many(scores[0], to_merge, to_merge_scores)
+        befores = [e.before for e in to_merge if e.before]
+        if befores:
+            before_event = befores[0]
+            to_merge_bef = [e.before for e in to_merge[1:] if e.before]
+            if to_merge_bef:
+                before_event.merge_with_many(
+                    1.0, [e for e in to_merge_bef], [1.0] * len(to_merge_bef)
+                )
+        else:
+            before_event = None
+
+        afters = [e.after for e in to_merge if e.after]
+        if afters:
+            after_event = afters[0]
+            to_merge_aft = [e.after for e in to_merge[1:] if e.after]
+            if to_merge_aft:
+                after_event.merge_with_many(
+                    1.0, [e for e in to_merge_aft], [1.0] * len(to_merge_aft)
+                )
+        else:
+            after_event = None
+
+        new_event.before = before_event
+        new_event.after = after_event
+
         new_results.append(new_event)
         new_scores.append(max(scores))
     print("[green]Merged into[/green]", len(new_results), "events")
 
     # ----------------------------- #
     # rerank
-    if RERANK:
-        encoded_text = get_model(data).encode_text(text)
-        threshold = 0.5
-        # Get the best image for each event
-        events = new_results
+    # if RERANK:
+    #     encoded_text = get_model(data).encode_text(text)
+    #     threshold = 0.5
+    #     # Get the best image for each event
+    #     events = new_results
 
-        # get keyframes
-        for event in events:
-            event.keyframes = get_keyframes_from_segments(encoded_text, data, event.images)
+    #     # get keyframes
+    #     for event in events:
+    #         event.main.keyframes = get_keyframes_from_segments(encoded_text, data, event.main.images)
 
-        # print([(best_image, event.images) for best_image, event in zip(best_images, events)])
-        reranker_scores = reranker.rerank_scenes(data, text, events)
+    #     # print([(best_image, event.images) for best_image, event in zip(best_images, events)])
+    #     main_events = [event.main for event in events]
+    #     reranker_scores = reranker.rerank_scenes(data, text, events)
 
-        # remove events with score < 0.5
-        events = [
-            event for event, score in zip(events, reranker_scores) if score >= threshold
-        ]
-        reranker_scores = [score for score in reranker_scores if score >= threshold]
-        print(f"Reranker: {len(events)} events with score >= {threshold} for {text}")
-        if events:
-            # Sort the scores
-            events, scores = zip(
-                *sorted(zip(events, reranker_scores), key=lambda x: x[1], reverse=True)
-            )
-            new_results = events
-            new_scores = scores
+    #     # remove events with score < 0.5
+    #     events = [
+    #         event for event, score in zip(events, reranker_scores) if score >= threshold
+    #     ]
+    #     reranker_scores = [score for score in reranker_scores if score >= threshold]
+    #     print(f"Reranker: {len(events)} events with score >= {threshold} for {text}")
+    #     if events:
+    #         # Sort the scores
+    #         events, scores = zip(
+    #             *sorted(zip(events, reranker_scores), key=lambda x: x[1], reverse=True)
+    #         )
+    #         new_results = events
+    #         new_scores = scores
 
     print("[blue]Sorting by[/blue]", relevant_fields.sort_by)
-    if relevant_fields.sort_by and len(events) > 0:
+    if relevant_fields.sort_by and len(triplet_events) > 1:
         # if len([sort for sort in relevant_fields.sort_by if sort.field != "score"]):
         #     # Sort by non-score fields
         #     # We must have a cut-off point
@@ -331,10 +362,10 @@ def merge_events(
         #     new_results = [event for event, score in zip(new_results, new_scores) if score > threshold]
         #     new_scores = [score for score in new_scores if score > threshold]
 
-        def get_sort_value(event: Event) -> List:
+        def get_sort_value(triplet_event: TripletEvent) -> List:
             values = []
             for sort in relevant_fields.sort_by:
-                val = getattr(event, sort.field)
+                val = getattr(triplet_event.main, sort.field)
                 if sort.field in SORT_VALUES:
                     values.append(SORT_VALUES[sort.field](val))
                 else:
@@ -359,13 +390,13 @@ def merge_events(
 
         # for sort in relevant_fields.sort_by[::-1]:
         new_results, new_scores = zip(
-            *sorted(zip(new_results, new_scores), key=cmp_to_key(comp_func))
+            *sorted(zip(new_results, new_scores), key=cmp_to_key(comp_func))  # type: ignore
         )
 
     print("[green]Merged into[/green]", len(new_results), "events")
-    return EventResults(
-        events=new_results,  # type: ignore
-        scores=new_scores,  # type: ignore
+    return TripletEventResults(
+        events=new_results,
+        scores=new_scores,
         relevant_fields=results.relevant_fields + derive_fields,
         min_score=results.min_score,
         max_score=results.max_score,
@@ -443,8 +474,10 @@ def limit_images_per_event(
             if len(images) <= max_images:
                 continue
 
+            image_sources = [img.src for img in images]
             visual_scores = score_images(
-                images, encoded_query, chosen_model=get_model(data)
+                image_sources, encoded_query, chosen_model=get_model(data),
+                data=data
             )
 
             # Sort the images by the visual score and the original score
@@ -454,10 +487,10 @@ def limit_images_per_event(
             ]
 
             sorted_images = [
-                x for _, x in sorted(zip(ensembled_scores, images), reverse=True)
+                x for _, x in sorted(zip(ensembled_scores, image_sources), reverse=True)
             ]
             chosen_images = sorted_images[:max_images]
-            indices = sorted([images.index(image) for image in chosen_images])
+            indices = sorted([image_sources.index(image) for image in chosen_images])
 
             new_images = [images[i] for i in indices]
             new_scores = [scores[i] for i in indices]
@@ -486,7 +519,8 @@ def basic_label(event: Event) -> str:
     else:
         location = event.user_id
     date = event.start_time.strftime("%d, %b %Y")
-    return f"<strong>{location}</strong>\n{date}, {time}"
+    timezone = event.timezone if event.timezone else "UTC"
+    return f"<strong>{location}</strong>\n{date}, {time}, {timezone}"
 
 
 def create_event_label(
@@ -622,6 +656,9 @@ def create_event_label(
                     if key in label and label[key]:
                         line.append(label[key])
                 if line:
+                    # add timzone if available
+                    if "timezone" in label:
+                        line.append(label["timezone"])
                     lines.append("@" + ", ".join(line))
 
                 line = []

@@ -18,7 +18,6 @@ memory = Memory(location="cache", verbose=0)
 # These could be adjusted in the frontend with settings
 DEV_MODE = False
 USE_GROQ = False
-IMAGE_SEARCH = True
 DEBUG = False
 CACHE = True
 
@@ -29,7 +28,6 @@ DEFAULT_SIZE = 200
 
 # LLM Configurations
 # ---------------- #
-ALL_OFF = False
 # Whether to parse the query or not with the LLM model
 QUERY_PARSER = True
 
@@ -37,17 +35,13 @@ QUERY_PARSER = True
 FILTER_FIELDS = True
 
 # Maximum number of images per event (0 for no limit)
-MAX_IMAGES_PER_EVENT = 20
+MAX_IMAGES_PER_EVENT = 10
 
 # Whether to merge events based on the relevant fields
 MERGE_EVENTS = True
 MAXIMUM_EVENT_TO_GROUP = 20
+WINDOW_SIZE = 500
 
-# Timeout for the MLMM model in seconds
-TIMEOUT = 60
-
-# Timeline Configurations
-TIMELINE_SPAN = 9  # If they want more, submit more
 RERANK = False
 
 # QA Configurations
@@ -61,7 +55,6 @@ BUILD_ON_STARTUP = True
 FORCE_CPU = False
 MODEL_NAME = "ViT-L-14-336"  # or ViT-H-14
 PRETRAINED_DATASET = "openai"  # or laion2b_s32b_b79k
-EMBEDDING_DIM = 768
 CLIP_EMBEDDINGS = os.environ.get("CLIP_EMBEDDINGS")
 # ==================== #
 
@@ -70,7 +63,7 @@ CLIP_EMBEDDINGS = os.environ.get("CLIP_EMBEDDINGS")
 # ====================== #
 DATA_YEARS = ["LSC23"]
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY")
-IMAGE_DIRECTORY = f"{CLIP_EMBEDDINGS}/Images"
+IMAGE_DIRECTORY = os.getenv("IMAGE_DIRECTORY", "images")
 DATA_DIRECTORY = os.environ.get("DATA_DIRECTORY")
 # ====================== #
 # Elasticsearch Configurations #
@@ -81,35 +74,11 @@ ES_URL = f"http://{ES_HOST}:{ES_PORT}"
 
 IMAGE_INDEX = os.getenv("INDEX", "all_lsc")
 SCENE_INDEX = os.getenv("SCENE_INDEX", "all_lsc_mean")
-CLIP_MIN_SCORE = 1.2  # 1.2 is the normal score, 1.0 is for Transf
-
-INCLUDE_SCENE = ["scene"]
-INCLUDE_FULL_SCENE = [
-    "images",
-    "start_time",
-    "end_time",
-    "gps",
-    "scene",
-    "group",
-    "timestamp",
-    "location",
-    "cluster_images",
-    "weights",
-    "country",
-    "ocr",
-    "country",
-    "location_info",
-    "duration",
-    "region",
-    "date",
-]
-
-INCLUDE_IMAGE = ["image_path", "time", "gps", "scene", "group", "location"]
 
 # ========================== #
 # Functions to derive fields #
 # ========================== #
-ESSENTIAL_FIELDS = ["images", "scene", "group", "start_time", "end_time", "gps", "time"]
+ESSENTIAL_FIELDS = ["images", "scene", "group", "start_time", "end_time", "gps", "time", "local_time", "timezone"]
 IMAGE_ESSENTIAL_FIELDS = [
     "image",
     "time",
@@ -236,7 +205,8 @@ EXPIRE_TIME = 60 * 5  # 5 minutes
 # ====================== #
 # Submitting to DRES
 # ====================== #
-DRES_URL = "https://vbs.videobrowsing.org/api/v2"
-LOGIN_URL = f"{DRES_URL}/login"
-LOGOUT_URL = f"{DRES_URL}/logout"
-SUBMIT_URL = f"{DRES_URL}/submit"
+DRES_URL = "https://vbs.videobrowsing.org/"
+DRES_API_URL = f"{DRES_URL}/api/v2"
+LOGIN_URL = f"{DRES_API_URL}/login"
+LOGOUT_URL = f"{DRES_API_URL}/logout"
+SUBMIT_URL = f"{DRES_API_URL}/submit"

@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from io import BytesIO
 import os
-from typing import List
+from typing import List, Optional
 from uuid import uuid4
 
 import pandas as pd
@@ -24,7 +24,7 @@ from database.segments import (
     get_saved_segments,
     save_segments_to_db,
 )
-from database.utils import get_full_data, get_unique_patient_ids, get_unique_values
+from database.utils import get_full_data, get_image_counts_per_date, get_segment_counts_per_date, get_unique_patient_ids, get_unique_values
 from myeachtra.auth_models import get_user, verify_user
 from myeachtra.map_router import map_router
 from myeachtra.timeline_router import timeline_router
@@ -34,23 +34,25 @@ from query_parse.types.requests import (
     ChoicesRequest,
     ChoicesResponse,
     Data,
+    EditAnnotationRequest,
     ExpandSegmentRequest,
     GeneralQueryRequest,
     ImageInfoRequest,
     LoginRequest,
     LoginResponse,
     SegmentRequest,
+    SimilaritySearchRequest,
 )
-from query_parse.visual import get_model
 from results.lifelog_questions import create_video
-from results.models import AnswerResultWithEvent, TripletEvent
+from results.models import AnswerResultWithEvent, EventResults, TripletEventResults
 from retrieval.dynamic_segmentation import (
     expand_single_image,
     get_keyframes_from_segments,
 )
 from retrieval.graph import get_vegalite, to_csv
-from retrieval.search import answer_single_event, get_segments_only, streaming_manager
+from retrieval.search import answer_single_event, get_segments_only, search_similar_events, streaming_manager
 from submit.router import submit_router
+from visual.main import get_model
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -174,6 +176,21 @@ async def answer_this(request: AnswerThisRequest):
         answers.append(answer)
     return answers
 
+@app.post(
+    "/similarity-search",
+    description="Search for similar images",
+    status_code=200,
+    response_model=Optional[TripletEventResults],
+)
+async def similarity_search(request: SimilaritySearchRequest):
+    """
+    Search for similar images based on a query
+    """
+    return await search_similar_events(
+        request.image,
+        request.data
+    )
+
 
 @app.post(
     "/query_to_csv",
@@ -239,25 +256,18 @@ async def get_choices(request: ChoicesRequest):
         case _, "date":
             choices = get_unique_values(request.data, "date", request.condition)
             annotations = []
-            for choice in choices:
-                # count dates
-                images = get_unique_values(request.data, "image", {"date": choice})
-                # get already segmented images
-                length = 0
-                eating = 0
-                print("Checking", choice, "for", request.condition)
-                patient_id = ""
-                if request.condition and "patient.id" in request.condition:
-                    patient_id = request.condition["patient.id"]
-                segments = get_saved_segments(request.data, patient_id, choice)
-                if segments:
-                    length = len(segments.segments)
-                    eating = sum(
-                        [segment.annotations.eating for segment in segments.segments]
-                    )
-                    annotations.append(f"{choice} ({length} segments, {eating} eating)")
-                else:
-                    annotations.append(f"{choice} ({len(images)} images)")
+            if request.condition and "patient.id" in request.condition:
+                patient_id = request.condition.get("patient.id", "")
+                image_counts = get_image_counts_per_date(patient_id)
+                segment_counts = get_segment_counts_per_date(patient_id)
+                print("Segment counts", segment_counts)
+                for date in choices:
+                    if date in segment_counts:
+                        length, eating = segment_counts[date]
+                        annotations.append(f"{date} ({length} segments, {eating} eating)")
+                    else:
+                        img_count = image_counts.get(date, 0)
+                        annotations.append(f"{date} ({img_count} images)")
             return ChoicesResponse(choices=choices, annotations=annotations)
         case _:
             raise HTTPException(
@@ -281,10 +291,12 @@ async def get_segments(request: SegmentRequest):
             request.data, request.patient_id, request.date
         )
         if saved_segments:
+            count = sum([len(segment.images) for segment in saved_segments.segments])
+            saved_segments.count = count
             return saved_segments
 
     query = "I am eating, or preparing food, or food (or drink) is visible"
-    events, num, eating = get_segments_only(
+    events, num, eating, heatmap = get_segments_only(
         query,
         EatingFilters(patient_id=[request.patient_id], date=[request.date]),
         data=request.data,
@@ -309,8 +321,9 @@ async def get_segments(request: SegmentRequest):
         date=request.date,
         segments=segments,
         count=num,
+        heatmap=heatmap,
     )
-    save_segments_to_db(request.data, results)
+    save_segments_to_db(request.data, results, skip_merge=True)
     return results
 
 
@@ -349,13 +362,13 @@ async def toogle_eating(request: ExpandSegmentRequest):
 
             if len(segment.images) == 1:
                 print("Single image segment")
+                new_annotations = segment.annotations
+                new_annotations.eating = not is_eating
                 new_segments = segments.segments[:i]
                 new_segments.append(
                     EventSegment(
                         images=segment.images,
-                        annotations=Annotation(
-                            eating=not is_eating,
-                        ),
+                        annotations=new_annotations,
                     )
                 )
                 new_segments += segments.segments[i + 1 :]
@@ -365,6 +378,7 @@ async def toogle_eating(request: ExpandSegmentRequest):
                         patient_id=request.patient_id,
                         date=request.date,
                         segments=new_segments,
+                        manually_checked=True
                     ),
                 )
                 return segments.segments
@@ -390,7 +404,6 @@ async def toogle_eating(request: ExpandSegmentRequest):
         # split the segment into 3
         segment = segments.segments[segment_idx]
         images = [img.src for img in segment.images]
-
         print(
             "Checking image in segment", segment_idx, "at", images.index(request.image)
         )
@@ -398,7 +411,6 @@ async def toogle_eating(request: ExpandSegmentRequest):
         new_start_idx = images.index(new_start)
         new_end_idx = images.index(new_end)
         new_label = not is_eating
-
         count = 0
         first_images = segment.images[:new_start_idx]
         if first_images:
@@ -453,7 +465,9 @@ async def toogle_eating(request: ExpandSegmentRequest):
         save_segments_to_db(
             request.data,
             EventSegments(
-                patient_id=request.patient_id, date=request.date, segments=new_segments
+                patient_id=request.patient_id, date=request.date, segments=new_segments,
+                manually_checked=True,  # Set to True to indicate manual changes
+
             ),
         )
         return new_segments
@@ -508,6 +522,7 @@ async def toogle_eating_all(request: ExpandSegmentRequest):
                     patient_id=request.patient_id,
                     date=request.date,
                     segments=new_segments,
+                    manually_checked=True,
                 ),
             )
             return segments.segments
@@ -531,12 +546,54 @@ async def annotate_segments(request: SegmentRequest):
     save_segments_to_db(
         request.data,
         EventSegments(
-            patient_id=request.patient_id, date=request.date, segments=segments
+            patient_id=request.patient_id, date=request.date, segments=segments,
         ),
         skip_merge=True,
     )
     return segments
 
+@app.post("/edit-annotations", description="Edit annotations", status_code=200)
+async def edit_annotations(request: EditAnnotationRequest):
+    """
+    Edit annotations for a segment
+    """
+    segments = get_saved_segments(request.data, request.patient_id, request.date)
+    if not segments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Segments not found for {request.patient_id} on {request.date}",
+        )
+
+    # Find the segment by ID
+    segment_id = request.segment_id
+    for i, segment in enumerate(segments.segments):
+        if i == segment_id:
+            # Update the annotation field
+            annotations = segment.annotations.model_dump()
+            for key, value in request.annotations.items():
+                if key in annotations:
+                    annotations[key] = value
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Annotation field {key} not found in segment",
+                    )
+            segments.segments[i] = EventSegment(
+                images=segment.images,
+                annotations=Annotation(**annotations),
+                keyframes=segment.keyframes,
+            )
+            print(f"Updated segment {segment_id} annotations: {annotations}")
+            break
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Segment with ID {segment_id} not found",
+        )
+
+    segments.manually_checked = True
+    save_segments_to_db(request.data, segments, skip_merge=True)
+    return segments
 
 @app.post("/download-segments", description="Download segments", status_code=200)
 async def download_segments(request: SegmentRequest):

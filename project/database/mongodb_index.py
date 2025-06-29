@@ -12,7 +12,6 @@ from query_parse.types.elasticsearch import GPS
 from results.models import Icon, Marker
 
 load_dotenv()
-
 # |%%--%%| <ukWc1wcVNW|rp7W9iwksc>
 
 client = MongoClient("localhost", 27017)

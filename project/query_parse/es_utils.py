@@ -23,7 +23,7 @@ from query_parse.types.elasticsearch import (
     VisualInfo,
 )
 from query_parse.types.lifelog import Mode, TimeCondition
-from query_parse.visual import siglip_model, clipa_model, clip_model
+from visual.main import siglip_model, clip_model
 
 
 def range_filter(
@@ -345,8 +345,6 @@ def get_visual_filters(visual_info: VisualInfo, embed_model: str = "sigclip"
         match embed_model:
             case "sigclip":
                 encoded_query = siglip_model.encode_text(visual_info.text).tolist()
-            case "clipa":
-                encoded_query = clipa_model.encode_text(visual_info.text).tolist()
             case _:
                 encoded_query = clip_model.encode_text(visual_info.text).tolist()
 

@@ -1,5 +1,3 @@
-import pandas as pd
-from pymongo import MongoClient
 from tqdm.auto import tqdm
 
 from database.main import get_db, scene_collection

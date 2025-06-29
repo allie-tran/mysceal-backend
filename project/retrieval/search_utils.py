@@ -20,6 +20,7 @@ from results.models import (
     EventResults,
     GenericEventResults,
     TripletEvent,
+    TripletEventResults,
 )
 from results.utils import create_event_label, deriving_fields
 from rich import print
@@ -332,15 +333,22 @@ def merge_msearch_with_main_results(
     return DoubletEventResults(events=doublets, scores=doublet_scores)
 
 
-def organize_by_relevant_fields(results, relevant_fields) -> EventResults:
+def organize_by_relevant_fields(results: TripletEventResults, relevant_fields) -> TripletEventResults:
     print(f"[green]Organizing by relevant fields: {relevant_fields}[/green]")
-    images = [image.src for event in results.events for image in event.images]
-    results.events = convert_to_events(images, relevant_fields, key="image")
+    images = [image.src for event in results.events for image in event.main.images]
+    main_events = convert_to_events(images, relevant_fields, key="image")
+    # Create a new TripletEventResults with the main events
+    for event, main_event in zip(results.events, main_events):
+        event.main = main_event
     results.relevant_fields = relevant_fields
+
     derivable_fields = set(relevant_fields) & set(DERIVABLE_FIELDS)
     if derivable_fields:
-        new_events = deriving_fields(results.events, list(derivable_fields))
-        results.events = new_events
+        events = [event.main for event in results.events]
+        new_events = deriving_fields(events, list(derivable_fields))
+        for event, new_event in zip(results.events, new_events):
+            event.main = new_event
+
     return results
 
 
@@ -353,6 +361,10 @@ def process_search_results(results: GenericEventResults) -> List[TripletEvent]:
     # Format into EventTriplets
     triplet_results = []
     for main in results.events:
+        if isinstance(main, TripletEvent):
+            # If it's already a triplet, just add it
+            triplet_results.append(main)
+            continue
         triplet = TripletEvent(main=main)
         if isinstance(main, DoubletEvent):
             if main.condition.condition == "before":
@@ -363,40 +375,3 @@ def process_search_results(results: GenericEventResults) -> List[TripletEvent]:
         triplet_results.append(triplet)
     # Yield the results
     return triplet_results
-
-
-def get_search_function(
-    request: GeneralQueryRequest,
-    single_query: Callable,
-    two_queries: Callable,
-    task_type: Task,
-) -> AsyncGenerator:
-    search_function = None
-    before, main, after = request.before, request.main, request.after
-    size = request.pipeline.size if request.pipeline else 200
-    match (before, main, after):
-        case ("", main, ""):
-            search_function = single_query(
-                request.main, request.filters, request.data, request.pipeline, task_type
-            )
-        case (before, main, ""):
-            search_function = two_queries(
-                main,
-                before or "",
-                TimeCondition(condition="before", time_limit_str=request.before_time),
-                size=size,
-                task_type=task_type,
-                data=request.data,
-            )
-        case ("", main, after):
-            search_function = two_queries(
-                main,
-                after or "",
-                TimeCondition(condition="after", time_limit_str=request.after_time),
-                size=size,
-                task_type=task_type,
-                data=request.data,
-            )
-        case (before, main, after):
-            raise NotImplementedError("Triplet is not implemented yet")
-    return search_function

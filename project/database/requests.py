@@ -26,7 +26,7 @@ def find_request(request: AnyRequest) -> Optional[dict]:
     Find the request in the database
     First, check the same request name
     """
-    create_new_collection(request.data)
+    # create_new_collection(request.data)
     db = get_db(request.data)
     criteria = request.find_one()
     if criteria:
@@ -45,6 +45,13 @@ def get_request(oid: Optional[str], data: Data = Data.LSC23) -> Optional[dict]:
         db = get_db(data)
         return request_collection(db).find_one({"_id": ObjectId(oid), "finished": True})
 
+def get_parsed_output(query: str, data: Data = Data.LSC23) -> Optional[dict]:
+    """
+    Get the parsed output by its oid
+    """
+    criteria = {"request.main": query, "finished": True}
+    db = get_db(data)
+    return request_collection(db).find_one(criteria)
 
 def get_es(oid: Optional[str], data: Data = Data.LSC23) -> Optional[dict]:
     if oid:
