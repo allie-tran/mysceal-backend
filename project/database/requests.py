@@ -8,7 +8,7 @@ from bson import ObjectId
 from configs import EXPIRE_TIME
 from query_parse.types.requests import AnyRequest, Data
 
-from database.main import es_collection, get_db, request_collection
+from database.main import es_collection, get_db, request_collection, llm_collection
 
 
 def create_new_collection(data: Data = Data.LSC23):
@@ -57,3 +57,32 @@ def get_es(oid: Optional[str], data: Data = Data.LSC23) -> Optional[dict]:
     if oid:
         db = get_db(data)
         return es_collection(db).find_one({"_id": ObjectId(oid), "extracted": True})
+
+def save_llm_outputs(
+    prompt: str = "",
+    model: str = "",
+    output: dict | None = None,
+) -> Optional[dict]:
+    """
+    Save the LLM outputs to the database
+    """
+    if not output:
+        return None
+    data = {
+        "prompt": prompt,
+        "model": model,
+        "output": output,
+    }
+    llm_collection.insert_one(data)
+    return data
+
+def get_llm_outputs(prompt: str = "", model: str = "") -> Optional[dict]:
+    """
+    Get the LLM outputs by its oid
+    """
+    return llm_collection.find_one(
+        {
+            "prompt": prompt,
+            "model": model,
+        }
+    )

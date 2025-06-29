@@ -33,5 +33,6 @@ location_collection = lambda db: db["locations"]
 user_collection = lambda db: db["users"]
 request_collection = lambda db: db["requests"]
 es_collection = lambda db: db["es"]
+llm_collection = LSC_DB["llm_outputs"]
 
 user_collection = client["MyEachtra"].users

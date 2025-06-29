@@ -1,4 +1,5 @@
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set
+from bisect import bisect_left, bisect_right
 
 import numpy as np
 from configs import WINDOW_SIZE
@@ -7,7 +8,6 @@ from pydantic import BaseModel
 from query_parse.types.lifelog import ParsedQuery, SingleQuery
 from query_parse.types.requests import Data
 from results.models import TripletEvent
-from rich import print
 from visual.features import SIGLIP_FEATURES
 from visual.low_visual import blurred
 from visual.main import ClipModel, get_model
@@ -170,46 +170,43 @@ def sliding_window_combinations_with_main(
 
     valid_combos = []
 
+    def find_best_combo_in_window(t0, t1) -> Sequence[Optional[int]]:
+        best_combo = [None] * num_queries
+        best_score = -float('inf')
+
+        def backtrack(q, last_time, path, total_score):
+            nonlocal best_combo, best_score
+            if q == num_queries:
+                if total_score > best_score:
+                    best_score = total_score
+                    best_combo = path[:]
+                return
+
+            times = times_selected[q]
+            scores = scores_selected[q]
+
+            i0 = bisect_left(times, t0 + 1)
+            i1 = bisect_right(times, t1 - 1)
+
+            for i in range(i0, i1):
+                t = times[i]
+                s = scores[i]
+                if t > last_time:
+                    path.append(i)
+                    backtrack(q + 1, t, path, total_score + s)
+                    path.pop()
+
+        backtrack(0, -float('inf'), [], 0)
+        return best_combo
+
     for t0 in range(min_time, max_time, stride):
         t1 = t0 + window_size
         combo = []
-        matched_main = False
-
-        for q in range(num_queries):
-            query_times = times_selected[q]
-            query_scores = scores_selected[q]
-
-            matches = [
-                (i, t, query_scores[i])
-                for i, t in enumerate(query_times)
-                if t0 < t < t1
-            ]
-
-            if matches:
-                best_idx, _, _ = max(matches, key=lambda x: x[2])
-                combo.append(best_idx)
-                if q == main_event:
-                    matched_main = True
-
-            else:
-                combo.append(None)
-
-        if not allow_none:
-            if None in combo:
-                continue
-
-        def is_increasing(i,j, t1, t2):
-            if t1 is None or t2 is None:
-                return True
-            return times_selected[i][t1] < times_selected[j][t2]
-
-        if matched_main:
-            valid = all(
-                is_increasing(i, i + 1, combo[i], combo[i + 1])
-                for i in range(num_queries - 1)
-            )
-            if valid:
-                valid_combos.append(tuple(combo))
+        combo = find_best_combo_in_window(t0, t1)
+        if combo:
+            if allow_none or all(x is not None for x in combo):
+                if main_event is None or combo[main_event] is not None:
+                    valid_combos.append(tuple(combo))
 
     # De-duplicate combinations
     valid_combos = list(set(valid_combos))
@@ -327,9 +324,9 @@ async def lsc25_multi_queries(
         # check if there are no overlapping images
         if before and after:
             if (
-                set(before.images) & set(after.images)
-                or set(before.images) & set(main.images)
-                or set(after.images) & set(main.images)
+                    set(before.images) & set(after.images)
+                    or set(before.images) & set(main.images)
+                    or set(after.images) & set(main.images)
             ):
                 continue
 
@@ -357,25 +354,25 @@ async def lsc25_multi_queries(
         events=events,
     )
 
-    # # top_results = [
-    # #     [SIGLIP_FEATURES[data].ids[p]
-    # #      for seg_id in segment_group
-    # #      for p in range(*fixed_segments[seg_id])]
-    # #     for segment_group in top_segment_ids
-    # # ]
+# # top_results = [
+# #     [SIGLIP_FEATURES[data].ids[p]
+# #      for seg_id in segment_group
+# #      for p in range(*fixed_segments[seg_id])]
+# #     for segment_group in top_segment_ids
+# # ]
 
-    # events = []
-    # for segment_group in top_segment_ids:
-    #     event = Event(
-    #         start_time=fixed_segments[segment_group[0]][0],
-    #         end_time=fixed_segments[segment_group[-1]][-1],
-    #         images=[SIGLIP_FEATURES[data].ids[i] for i in segment_group],
-    #     )
-    #     events.append(event)
+# events = []
+# for segment_group in top_segment_ids:
+#     event = Event(
+#         start_time=fixed_segments[segment_group[0]][0],
+#         end_time=fixed_segments[segment_group[-1]][-1],
+#         images=[SIGLIP_FEATURES[data].ids[i] for i in segment_group],
+#     )
+#     events.append(event)
 
-    # return SegmentResult(
-    #     segment_scores=[total_scores[i] for i in top_idxs],
-    #     scores=[similarities[i] for i in top_idxs],
-    #     high_score_indices=top_idxs.tolist(),
-    #     events=events,
-    # )
+# return SegmentResult(
+#     segment_scores=[total_scores[i] for i in top_idxs],
+#     scores=[similarities[i] for i in top_idxs],
+#     high_score_indices=top_idxs.tolist(),
+#     events=events,
+# )

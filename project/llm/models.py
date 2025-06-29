@@ -17,6 +17,7 @@ from openai.types.chat import (
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from partialjson.json_parser import JSONParser
 from pyrate_limiter import BucketFullException, Duration, Limiter, Rate
+from database.requests import get_llm_outputs, save_llm_outputs
 from retrieval.async_utils import async_generator_timer
 from rich import print
 
@@ -155,12 +156,27 @@ class LLM:
         Then parse the JSON object from the completion
         If the completion is not a JSON object, return the text
         """
+        cached_outputs = get_llm_outputs(
+            prompt=text, model=model or self.model_name
+        )
+        if cached_outputs and cached_outputs.get("output"):
+            if DEBUG:
+                print("Using cached outputs")
+            return cached_outputs["output"]
+
         messages = [self.template_message]
         messages.append(ChatCompletionUserMessageParam(role="user", content=text))
         res = None
         async for data in self.__generate_and_parse(messages, stream=False, model=model):
             await asyncio.sleep(0)
             res = data
+
+        # Store the output in the database
+        save_llm_outputs(
+            prompt=text,
+            model=model or self.model_name,
+            output=res,
+        )
         return res
 
     async def stream_from_text(
