@@ -1,16 +1,18 @@
 from typing import List, Optional
 
+from database.utils import segment_to_event
 from llm import vllm_model
 from llm.models import MixedContent
 from myeachtra.dependencies import CamelCaseModel
 from query_parse.types.requests import Data
 from question_answering.video import get_openai_visual_message
-from results.models import HeatmapResults, Image
+from results.models import Event, HeatmapResults, Image
 from rich import print as rprint
+from results.utils import basic_label
 from visual.main import encode_text
 
 from database.main import get_db
-from retrieval.dynamic_segmentation import get_keyframes_from_segments
+from visual.segments import get_keyframes_from_segments
 
 
 # ====================== #
@@ -25,6 +27,7 @@ class Annotation(CamelCaseModel):
 
 
 class EventSegment(CamelCaseModel):
+    name: str = ""
     images: List[Image] = []
     keyframes: List[Image] = []
     annotations: Annotation
@@ -53,7 +56,10 @@ def save_segments_to_db(data: Data, segments: EventSegments, skip_merge: bool = 
     encoded_query = encode_text("I am eating or interacting with food")
     for segment in segments.segments:
         if not segment.keyframes:
+            event = segment_to_event(data, [img.src for img in segment.images])
             segment.keyframes = get_keyframes_from_segments(encoded_query, data, segment.images)
+            if event:
+                segment.name = basic_label(event, data)
 
     upserted = db["segments"].update_one(
         {

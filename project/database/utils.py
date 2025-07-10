@@ -32,6 +32,9 @@ def to_event(data: Data, image: dict) -> Event:
     try:
         if data == Data.Deakin:
             image["time"] = image["snap"]["local_time"]
+        elif data == Data.CASTLE:
+            image["time"] = image["local_time"]
+
         image["start_time"] = image.pop("time")
         image["end_time"] = image["start_time"]
         timezone = image.pop("timezone", "UTC")
@@ -58,6 +61,9 @@ def to_event(data: Data, image: dict) -> Event:
 
         if "patient" in image:
             image["user_id"] = image["patient"]["id"]
+
+        if "person" in image:
+            image["user_id"] = image["person"]
 
         return Event(**image, data=data)
     except KeyError as e:
@@ -93,7 +99,7 @@ def convert_to_events(
             rprint("[red]Error in convert_to_events[/red]", e)
 
     if not documents:
-        documents = collection(db).find({key: {"$in": key_list}})
+        documents = collection(db).find({key: {"$in": key_list}}, projection=fields)
 
     # Sort the documents based on the order of the event_list
     documents = sorted(documents, key=lambda doc: index[doc[key]])
@@ -122,6 +128,7 @@ def image_src_to_image_object(images: List[str], data: Data) -> List[Image]:
     }
     return [docs[image] for image in images if image in docs]
 
+
 def segment_to_event(
     data: Data,
     images: List[str],
@@ -130,7 +137,9 @@ def segment_to_event(
     Convert a list of images and scores to an Event object
     """
     db = get_db(data)
-    documents = image_collection(db).find({"image": {"$in": images}})
+    documents = image_collection(db).find(
+        {"image": {"$in": images}}, projection=IMAGE_ESSENTIAL_FIELDS
+    )
     image_to_doc = {doc["image"]: doc for doc in documents}
     images = [img for img in images if img in image_to_doc]
 
@@ -169,6 +178,9 @@ def segments_to_events(
             start, end = segment
             images.extend(photo_ids[start:end])
 
+    print(len(images), "images to process")
+    print(images[0:10], "first 10 images")
+
     documents = []
 
     if relevant_fields:
@@ -181,9 +193,13 @@ def segments_to_events(
             rprint("[red]Error in convert_to_events[/red]", e)
 
     if not documents:
-        documents = image_collection(db).find({"image": {"$in": images}})
-
+        documents = image_collection(db).find(
+            {"image": {"$in": images}}, projection=IMAGE_ESSENTIAL_FIELDS
+        )
     image_to_doc = {doc["image"]: doc for doc in documents}
+    print(
+        f"Found {len(image_to_doc)} documents for {len(images)} images in the database"
+    )
     events = []
     for segment, score in zip(segments, scores):
         images = []
@@ -192,9 +208,7 @@ def segments_to_events(
         else:
             start, end = segment
             images = photo_ids[start:end]
-        event_images = [
-            photo for photo in images if photo in image_to_doc
-        ]
+        event_images = [photo for photo in images if photo in image_to_doc]
         if not event_images:
             continue
         event = to_event(data, image_to_doc[event_images[0]])

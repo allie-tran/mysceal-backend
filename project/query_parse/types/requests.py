@@ -24,6 +24,7 @@ from query_parse.types.options import SearchPipeline
 class Data(StrEnum):
     LSC23 = "LSC23"
     Deakin = "Deakin"
+    CASTLE = "CASTLE"
 
 # ====================== #
 # Authentication

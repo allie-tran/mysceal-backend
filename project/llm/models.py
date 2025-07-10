@@ -22,6 +22,8 @@ from retrieval.async_utils import async_generator_timer
 from rich import print
 
 from llm.prompts import INSTRUCTIONS
+import logging
+logging.getLogger("pyrate_limiter").setLevel(logging.WARNING)
 
 parser = JSONParser()
 parser.on_extra_token = lambda *_, **__: None

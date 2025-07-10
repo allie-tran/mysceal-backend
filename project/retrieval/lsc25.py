@@ -1,23 +1,31 @@
-from typing import List, Optional, Sequence, Set
 from bisect import bisect_left, bisect_right
+from typing import List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from configs import WINDOW_SIZE
 from database.utils import segment_to_event, segments_to_events
 from pydantic import BaseModel
-from query_parse.types.lifelog import ParsedQuery, SingleQuery
+from query_parse.types.lifelog import ParsedQuery, RelevantFields, SingleQuery
 from query_parse.types.requests import Data
-from results.models import TripletEvent
+from results.models import TripletEvent, TripletEventResults
+from results.utils import merge_events
 from visual.features import SIGLIP_FEATURES
+from visual.main import THRESHOLD, ClipModel, get_model, get_model_by_name
 from visual.low_visual import blurred
-from visual.main import ClipModel, get_model
-from visual.segments import get_segments_from_top_photos, merge_results, presegments
+from visual.segments import (
+    get_segments_from_top_photos,
+    merge_results,
+    presegments,
+    send_deakin_rerank_request,
+)
 from visual.types import Array1D
 
 from retrieval.async_utils import async_timer, timer
+from retrieval.graph_utils import get_heatmap_from_images
 
 
 class SegmentResult(BaseModel):
+    segments: List[Tuple[int, int]]  # List of (start, end) tuples for segments
     segment_scores: List[float]
     scores: List[float]
     high_score_indices: List[int]
@@ -29,7 +37,7 @@ async def lsc25_get_segments(
     query: SingleQuery,
     data: Data = Data.LSC23,
     score_percentile: int = 99,
-    include_only: Optional[Set[str]] = None,
+    include_only: set[str] | None = None,
     # metadata_scores: dict = {},
     top_n: int = 100,
 ) -> SegmentResult:
@@ -63,31 +71,39 @@ def get_segments_from_similarity_scores(
     top_photos = [SIGLIP_FEATURES[data].ids[i] for i in top_indices]
     top_similarities = similarities[top_indices]
 
-    _, fixed_segments, photo_to_segment_id, _ = presegments[data]
-
-    segments, segment_scores = get_segments_from_top_photos(
-        top_photos,
-        top_similarities.tolist(),
-        fixed_segments,
-        photo_to_segment_id,
-        blurred[data],
+    segments, segment_photos, segment_scores = get_segments_from_top_photos(
+        top_photos, top_similarities.tolist(), data
     )
-
-    all_images = []
-    for photos in segments:
-        all_images.extend(photos)
 
     events = segments_to_events(
         data,
-        segments,
+        segment_photos,
         segment_scores,
         SIGLIP_FEATURES[data].ids,
     )
+
+    if data == Data.LSC23:
+        merged_events = merge_events(
+            "",
+            data,
+            TripletEventResults(
+                events=[TripletEvent(main=event) for event in events],
+                scores=segment_scores,
+            ),
+            RelevantFields(merge_by=["location"]),
+        )
+    else:
+        merged_events = TripletEventResults(
+            events=[TripletEvent(main=event) for event in events],
+            scores=segment_scores,
+        )
+
     return SegmentResult(
-        segment_scores=segment_scores,
+        segments=segments,
+        segment_scores=merged_events.scores,
         scores=similarities.tolist(),
         high_score_indices=high_score_indices,
-        events=[TripletEvent(main=event) for event in events],
+        events=merged_events.events,
     )
 
 
@@ -172,7 +188,7 @@ def sliding_window_combinations_with_main(
 
     def find_best_combo_in_window(t0, t1) -> Sequence[Optional[int]]:
         best_combo = [None] * num_queries
-        best_score = -float('inf')
+        best_score = -float("inf")
 
         def backtrack(q, last_time, path, total_score):
             nonlocal best_combo, best_score
@@ -196,7 +212,7 @@ def sliding_window_combinations_with_main(
                     backtrack(q + 1, t, path, total_score + s)
                     path.pop()
 
-        backtrack(0, -float('inf'), [], 0)
+        backtrack(0, -float("inf"), [], 0)
         return best_combo
 
     for t0 in range(min_time, max_time, stride):
@@ -230,7 +246,10 @@ async def lsc25_multi_queries(
 
     # Step 1: Get all scores for each query
     similarities = [
-        await get_lsc25_scores(model, query, include_only, data, visual_only=main_event != i) for i, query in enumerate(queries)
+        await get_lsc25_scores(
+            model, query, include_only, data, visual_only=main_event != i
+        )
+        for i, query in enumerate(queries)
     ]
 
     segment_scores = [
@@ -239,7 +258,7 @@ async def lsc25_multi_queries(
     ]
 
     # Step 2: Select top candidates based on percentiles, max 2000
-    candidates = [] # list of list of segment indices
+    candidates = []  # list of list of segment indices
     scores_selected = []
     for scores in segment_scores:
         # Get the top 2000 scores
@@ -256,8 +275,12 @@ async def lsc25_multi_queries(
     times_selected = [[segments[i][0] for i in c] for c in candidates]
 
     valid_combos = sliding_window_combinations_with_main(
-        times_selected, scores_selected, main_event=main_event, allow_none=True,
-        window_size=window_size, stride=window_size // 20
+        times_selected,
+        scores_selected,
+        main_event=main_event,
+        allow_none=True,
+        window_size=window_size,
+        stride=window_size // 20,
     )
 
     top_combos = valid_combos
@@ -267,7 +290,11 @@ async def lsc25_multi_queries(
     weights = np.array([1.0] * len(queries))
     weights[main_event] = 1.5  # Give more weight to the main event
     total_scores = [
-        sum(scores_selected[d][idx] * weights[d] for d, idx in enumerate(combo) if idx is not None)
+        sum(
+            scores_selected[d][idx] * weights[d]
+            for d, idx in enumerate(combo)
+            if idx is not None
+        )
         + 0.1 * sum(1 for idx in combo if idx is not None)  # small bonus per match
         for combo in valid_combos
     ]
@@ -292,7 +319,7 @@ async def lsc25_multi_queries(
         SIGLIP_FEATURES[data].ids,
         segments,
         allow_none=False,
-        events=segmented_events
+        events=segmented_events,
     )
 
     # put events into before, main, after
@@ -324,9 +351,9 @@ async def lsc25_multi_queries(
         # check if there are no overlapping images
         if before and after:
             if (
-                    set(before.images) & set(after.images)
-                    or set(before.images) & set(main.images)
-                    or set(after.images) & set(main.images)
+                set(before.images) & set(after.images)
+                or set(before.images) & set(main.images)
+                or set(after.images) & set(main.images)
             ):
                 continue
 
@@ -348,11 +375,13 @@ async def lsc25_multi_queries(
     high_score_indices = np.where(image_scores > 0)[0].tolist()
 
     return SegmentResult(
+        segments=[],
         segment_scores=merged_scores,
         scores=image_scores.tolist(),
         high_score_indices=high_score_indices,
         events=events,
     )
+
 
 # # top_results = [
 # #     [SIGLIP_FEATURES[data].ids[p]
@@ -376,3 +405,163 @@ async def lsc25_multi_queries(
 #     high_score_indices=top_idxs.tolist(),
 #     events=events,
 # )
+
+
+@timer("get_segments_related_to_text")
+async def get_segments_related_to_text(
+    query: str,
+    data: Data = Data.LSC23,
+    filters: set[str] | None = None,
+):
+    photo_ids = SIGLIP_FEATURES[data].ids
+    features = SIGLIP_FEATURES[data].embeddings
+    model = get_model_by_name("siglip")
+
+    similarities = await get_lsc25_scores(
+        model, SingleQuery(full_text=query), include_only=filters, data=data
+    )
+    segment_scores = get_all_segment_scores_from_scores(similarities.tolist(), data)
+    non_zeros = np.where(np.array(segment_scores) > 0)[0]
+    non_zero_scores = np.array(segment_scores)[non_zeros]
+    print(f"Found {len(non_zeros)} segments with non-zero scores")
+
+    # rerank segments
+    results = []
+    scores = []
+    hits = []
+    score_threshold = np.percentile(non_zero_scores, 90)
+    print(f"Score threshold: {score_threshold}")
+    lower_score_threshold = np.percentile(non_zero_scores, 50)
+
+    print("Reranking segments")
+    segments, segment_photos, *_ = presegments[data]
+    for i in range(len(segment_scores)):
+        if segment_scores[i] <= 0:
+            continue
+
+        images = [photo for photo in segment_photos[i] if photo not in blurred[data]]
+        start, end = segments[i]
+        score = segment_scores[i]
+        results += [(start, end)]
+        okay = False
+        if score > score_threshold:
+            okay = True
+        else:
+            photo_scores = similarities[start:end]
+            score = np.mean(photo_scores)
+            if score > score_threshold:
+                okay = True
+            elif score > lower_score_threshold:
+                # keyframes = get_keyframes_from_segments(encoded_query, data, images)
+                # keyframes = [k.src if isinstance(k, Image) else k for k in keyframes]
+                # score = reranker.score(
+                #     data,
+                #     query,
+                #     keyframes,
+                #     prompt="Is anyone eating or drinking in these images? Answer with True or False.",
+                #     tokens=["True", "False"],
+                # )
+                # if score > 0.5:
+                #     print("Reranked", score)
+                #     okay = True
+                # else:
+                rerank = send_deakin_rerank_request(
+                    images,
+                    instruction="Is anyone eating or drinking?",
+                )
+                rerank["score"] = score
+                print("Deakin rerank", rerank)
+                if rerank["is_eating"]:
+                    okay = True
+                    score = score * 1.5
+        if okay:
+            scores.append(score)
+            hits.append(True)
+        else:
+            scores.append(-1)
+            hits.append(False)
+
+    print(
+        f"Filtered to {len([s for s in scores if s > -1])} segments"
+    )
+    assert len(results) == len(scores)
+
+    # merge consecutive segments that have the same category
+    threshold = THRESHOLD
+    to_merge = True
+    if to_merge:
+        merged_segments = []
+        merged_scores = []
+        merged_hits = []
+        i = 0
+        current_scores = []
+        while i < len(results):
+            start, end = results[i]
+            current_scores = [scores[i]]
+            j = i + 1
+            while j < len(results):
+                next_start, next_end = results[j]
+                if hits[i] == hits[j]:
+                    end = next_end
+                    current_scores.append(scores[j])
+                else:
+                    if hits[j]:
+                        # 0 - 1
+                        break
+                    else:
+                        # 1 - 0
+                        okay = False
+                        if next_end - next_start < 3:
+                            # if the segment is too small, then it is okay to merge
+                            okay = True
+                        else:
+                            feat1 = features[start:end]
+                            feat2 = features[next_start:next_end]
+                            feat1 = np.mean(feat1, axis=0)
+                            feat2 = np.mean(feat2, axis=0)
+                            score = feat1 @ feat2.T
+                            if score > threshold:
+                                okay = True
+
+                        if okay:
+                            end = next_end
+                            current_scores.append(scores[j])
+
+                        # don't merge too many segments
+                        break
+                j += 1
+
+            merged_segments.append((start, end))
+            merged_scores.append(max(current_scores))
+            merged_hits.append(hits[i])
+            i = j
+
+        results = merged_segments
+        scores = merged_scores
+        hits = merged_hits
+        print(f"Merged to {len([i for i in hits if i])} segments")
+
+    # Filter out segments that are not high scoring
+    idx = [i for i, hit in enumerate(hits) if hit]
+    results = [results[i] for i in idx]
+    scores = [scores[i] for i in idx]
+
+    # print(f"Reranked to {len(new_results)} segments")
+    filtered_indices = set(range(len(photo_ids)))
+    if filters is not None:
+        filtered_indices = set(
+            i for i, photo_id in enumerate(photo_ids) if photo_id in filters
+        )
+
+    heatmap = get_heatmap_from_images(
+        images=[photo_ids[i] for i in filtered_indices],
+        scores=[similarities[i] for i in filtered_indices],
+    )
+
+    return {
+        "segments": results,
+        "segment_scores": scores,
+        "scores": similarities.tolist(),
+        "heatmap": heatmap,
+        "high_score_indices": [],
+    }

@@ -1,19 +1,24 @@
 import json
+import tqdm
 import os
-from typing import Dict, List, Set, Tuple
+import subprocess
+from typing import Dict, List, Set, Tuple, TypeVar
 
 import numpy as np
 import pandas as pd
+import requests
 from configs import CLIP_EMBEDDINGS, DATA_DIRECTORY
 from database.main import get_db, image_collection
 from database.utils import segments_to_events
 from query_parse.types.requests import Data
-from results.models import Event
+from results.models import Event, Image
 from retrieval.async_utils import timer
 from rich import print as rprint
+from sklearn.cluster import KMeans
 
 from visual.features import SIGLIP_FEATURES
 from visual.low_visual import blurred_indices
+from visual.main import get_model
 
 
 def compare_images(data: Data, image1: dict, image2: dict):
@@ -40,27 +45,73 @@ def compare_images(data: Data, image1: dict, image2: dict):
             return True
         if image1["date"] != image2["date"]:
             return True
-
+    elif data == Data.CASTLE:
+        if image1["day"] != image2["day"]:
+            return True
+        if image1["person"] != image2["person"]:
+            return True
+        if (image1["utc_time"] - image2["utc_time"]).total_seconds() > time_gap:
+            return True
     return False
 
 
 def get_fixed_boundaries(data):
+    print(f"Finding fixed boundaries for {data}...")
     sort_criteria = None
     if data == Data.LSC23:
         sort_criteria = [("utc_time", 1)]
     elif data == Data.Deakin:
         sort_criteria = [("patient.id", 1), ("snap.local_time", 1)]
+    elif data == Data.CASTLE:
+        sort_criteria = [("day", 1), ("person", 1), ("utc_time", 1)]
 
     boundaries: set[int] = set()
     prev_image = None
-    for image_data in image_collection(get_db(data)).find().sort(sort_criteria):
-        if prev_image is not None:
-            if compare_images(data, prev_image, image_data):
-                try:
-                    boundaries.add(SIGLIP_FEATURES[data].ids.index(prev_image["image"]))
-                except ValueError:
-                    pass
-        prev_image = image_data
+    pbar = tqdm.tqdm(
+        desc=f"Finding fixed boundaries for {data}",
+        total=image_collection(get_db(data)).count_documents({}),
+    )
+    if data == Data.CASTLE:
+        # split into days and persons
+        days = image_collection(get_db(data)).distinct("day")
+        persons = image_collection(get_db(data)).distinct("person")
+        for day in days:
+            for person in persons:
+                first_image = True
+                images = (
+                    image_collection(get_db(data))
+                    .find({"day": day, "person": person})
+                    .sort([("utc_time", 1)])
+                )
+                pbar.set_description(
+                    f"Finding fixed boundaries for {data} - {day} - {person}"
+                )
+                for image_data in images:
+                    pbar.update(1)
+                    if first_image:
+                        boundaries.add(
+                            SIGLIP_FEATURES[data].ids.index(image_data["image"]["src"])
+                        )
+                        first_image = False
+                    elif prev_image is not None:
+                        if compare_images(data, prev_image, image_data):
+                            try:
+                                boundaries.add(
+                                    SIGLIP_FEATURES[data].ids.index(prev_image["image"]["src"])
+                                )
+                            except ValueError:
+                                pass
+                    prev_image = image_data
+    else:
+        for image_data in image_collection(get_db(data)).find().sort(sort_criteria):
+            pbar.update(1)
+            if prev_image is not None:
+                if compare_images(data, prev_image, image_data):
+                    try:
+                        boundaries.add(SIGLIP_FEATURES[data].ids.index(prev_image["image"]))
+                    except ValueError:
+                        pass
+            prev_image = image_data
     return boundaries
 
 
@@ -71,6 +122,7 @@ def create_new_segments(
     fixed_boundaries = get_fixed_boundaries(data)
     # Segment the data
     # sort features by the photo_ids
+    print(f"Found {len(fixed_boundaries)} fixed boundaries for {data}.")
     all_sims = []
 
     for i in range(len(photo_ids) - 1):
@@ -85,7 +137,7 @@ def create_new_segments(
     threshold = np.percentile(all_sims, 80)
 
     # Get segments from left to right
-    segments = []
+    segments: list[tuple[int, int]] = []
     start = 0
     end = 1
 
@@ -102,6 +154,10 @@ def create_new_segments(
                 sim = sim / 2
                 if sim < threshold:
                     is_boundary = True
+
+        # check if the segment is too long
+        if end - start > 1000:
+            is_boundary = True
 
         if is_boundary:
             segments.append((start, end + 1))
@@ -153,7 +209,9 @@ def load_segments(
             with open(segment_path, "w") as f:
                 json.dump(segments, f)
 
+        # segments = [(segment[0], segment[1]) for segment in segments]
         rprint(f"[green]Found {len(segments)} segments for {data}.[/green]")
+
         segment_photos = []
         photo_to_segment_id = {}
         used = set()
@@ -173,36 +231,40 @@ def load_segments(
             unused_photos = all_photo_ids - used
             print(f"Unused photo IDs: {len(unused_photos)}")
 
-        events = segments_to_events(data,
-            segments, [1] * len(segments), photo_ids,
+        events = segments_to_events(
+            data,
+            segments,
+            [1] * len(segments),
+            photo_ids,
         )
 
         return segments, segment_photos, photo_to_segment_id, events
     except Exception as e:
-        print(f"Error loading segments for {data}: {e}")
+        raise (e)
+        rprint(f"[red]Error loading segments for {data}: {e}[/red]")
         return [], [], {}, []
 
 
-presegments = {data: load_segments(data) for data in [Data.LSC23, Data.Deakin]}
+presegments = {
+    data: load_segments(data) for data in [Data.LSC23, Data.Deakin, Data.CASTLE]
+}
 
 
 def get_segments_from_top_photos(
     top_photos: List[str],
     scores: List[float],
-    segments: List[List[str]],
-    photo_to_segment_id: Dict[str, int],
-    blurred: Set[str],
-) -> Tuple[List[List[str]], List[float]]:
+    data: Data,
+) -> Tuple[List[Tuple[int, int]], List[List[str]], List[float]]:
+    segments, _, photo_to_segment_id, _ = presegments[data]
+    photo_ids = SIGLIP_FEATURES[data].ids
+    blurred = blurred_indices[data]
+
     done = set()
-    found_segments = []
+    segment_photos = []
     segment_scores = []
+    valid_segments = []
 
     for photo_id, score in zip(top_photos, scores):
-        # # Test
-        # found_segments.append([photo_id])
-        # segment_scores.append(score)
-        # continue
-
         # get the segment for the photo_id
         segment_id = photo_to_segment_id.get(photo_id, None)
         if segment_id is None:
@@ -212,20 +274,27 @@ def get_segments_from_top_photos(
             continue
         try:
             segment = segments[segment_id]
-            segment = [photo for photo in segment if photo not in blurred]
-            found_segments.append(segment)
+            valid_segments.append(segment)
+            segment_photos.append(
+                [photo_ids[photo] for photo in segment if photo not in blurred]
+            )
             segment_scores.append(score)
             done.add(segment_id)
         except (KeyError, IndexError):
             print(f"Photo ID {photo_id} not found in segments, skipping.")
             continue
 
-    return found_segments, segment_scores
+    return valid_segments, segment_photos, segment_scores
 
 
 @timer("merge_results")
 def merge_results(
-    all_scores, top_segment_ids, top_scores, photo_ids, segments, allow_none=True,
+    all_scores,
+    top_segment_ids,
+    top_scores,
+    photo_ids,
+    segments,
+    allow_none=True,
     events: List[Event] = [],
 ) -> Tuple[List[List[List[str]]], List[float]]:
     print(f"Merging results for {len(top_segment_ids)} top segments...")
@@ -250,22 +319,23 @@ def merge_results(
             print(f"Segment {i} contains {to_check} ({to_check_id}). Segment: {combo}")
             to_checks.append(i)
         if seg_to_check_2 is not None and seg_to_check_2 in combo:
-            print(f"Segment {i} contains {to_check_2} ({to_check_2_id}). Segment: {combo}")
+            print(
+                f"Segment {i} contains {to_check_2} ({to_check_2_id}). Segment: {combo}"
+            )
             to_checks.append(i)
 
     print("--" * 20)
-    print(f"Checking for overlaps with {to_check} ({to_check_id}) and {to_check_2} ({to_check_2_id})")
+    print(
+        f"Checking for overlaps with {to_check} ({to_check_id}) and {to_check_2} ({to_check_2_id})"
+    )
     for i, combo in enumerate(top_segment_ids):
         if i in used:
             continue
         group = [i]
         used.add(i)
         for j in range(i + 1, len(top_segment_ids)):
-            debug = i in to_checks or j in to_checks
             if j in used:
                 continue
-            # if debug:
-                # print(f"Checking overlap between {i} and {j}: {combo} vs {top_segment_ids[j]}")
 
             overlap_found = False
             for s1, s2 in zip(combo, top_segment_ids[j]):
@@ -295,7 +365,6 @@ def merge_results(
                 if not (end1 <= start2 or end2 <= start1):
                     overlap_found = True
                     break
-
 
             if overlap_found:
                 # If they are, we can merge them
@@ -346,3 +415,194 @@ def merge_results(
 
     print(f"Merged into {len(merged_results)} groups.")
     return merged_results, merged_scores
+
+
+I = TypeVar("I", Image, str)
+
+
+def restart_ssh_tunnel():
+    """
+    Restart the SSH tunnel to the Deakin server.
+    This is a placeholder function that should be implemented
+    with the actual logic to restart the SSH tunnel.
+    """
+    print("Restarting SSH tunnel...")
+    # Implement the logic to restart the SSH tunnel here
+    # For example, using subprocess to run an SSH command
+    subprocess.run(
+        ["ssh", "-f", "-N", "-L", "8080:localhost:8080", "tranl@AdaptCluster"],
+        check=True,
+    )
+    print("SSH tunnel restarted.")
+
+
+def send_deakin_rerank_request(
+    image_files: List[str],
+    instruction: str = "Is anyone eating or drinking?",
+):
+    api = "http://localhost:8080/predict"
+    # image_files = [
+    #     os.path.join(IMAGE_DIRECTORY, "Deakin", image_file)
+    #     for image_file in image_files
+    # ]
+    # files = [("data", (open(img_path, "rb"))) for img_path in image_files]
+    # response = requests.post(api, files=files, data={"instruction": instruction, "return_description": False})
+    response = requests.post(
+        api,
+        json={
+            "return_description": False,
+            "images": image_files,
+        },
+    )
+    if response.status_code == 403:
+        print("SSH tunnel might be down, restarting...")
+        restart_ssh_tunnel()
+        response = requests.post(
+            api,
+            json={
+                "return_description": False,
+                "images": image_files,
+            },
+        )
+    if response.status_code != 200:
+        print(response.text)
+        raise Exception(f"Request failed with status code {response.status_code}")
+    response_data = response.json()
+
+    return {
+        "caption": response_data.get("caption", ""),
+        "is_eating": response_data.get("conclusion", "") == "YES",
+        "score": response_data.get("score", 0.0),
+    }
+
+
+def get_keyframes_from_segments(
+    encoded_query: np.ndarray | None, data: Data, images: List[I]
+) -> List[I]:
+    # for each segment, use dbscan to cluster the images
+    # for each cluster, get the average score
+    # for each cluster, get the image with the closest score to the average score and the highest to others average scores
+    # return the list of images
+    photo_ids = SIGLIP_FEATURES[data].ids
+    features = SIGLIP_FEATURES[data].embeddings
+    low_density_indices = blurred_indices[data]
+
+    max_num = 4
+
+    if len(images) <= max_num:
+        return images
+
+    image_src_to_image: dict[str, I] = {}
+    image_srcs: list[str] = []
+    for image in images:
+        if isinstance(image, Image):
+            image_src_to_image[image.src] = image
+            image_srcs.append(image.src)
+        else:
+            image_src_to_image[image] = image
+            image_srcs.append(image)
+
+    image_set = set(image_srcs)
+
+    # Get the segment images that are not in the low density indices
+    segment_ids = [i for i, image in enumerate(photo_ids) if image in image_set]
+    segment_ids = [i for i in segment_ids if i not in low_density_indices]
+    good_images = [image_src_to_image[photo_ids[i]] for i in segment_ids]
+
+    if len(good_images) < max_num:
+        return good_images
+
+    segment_features = features[np.array(segment_ids)]
+
+    # cluster the images
+    dbscan = KMeans(
+        n_clusters=min(len(good_images), max_num),
+        init="k-means++",
+        random_state=42,
+        n_init="auto",
+    )
+    clusters = dbscan.fit_predict(segment_features)
+
+    chunk = []
+    for cluster in set(clusters):
+        cluster_images = [
+            image for i, image in enumerate(good_images) if clusters[i] == cluster
+        ]
+        cluster_set = set()
+        for image in cluster_images:
+            if isinstance(image, Image):
+                cluster_set.add(image.src)
+            else:
+                cluster_set.add(image)
+
+        if len(cluster_images) == 1:
+            chunk.append(cluster_images[0])
+        else:
+            cluster_ids = [
+                i for i, image in enumerate(photo_ids) if image in cluster_set
+            ]
+            cluster_features = features[np.array(cluster_ids)]
+            cluster_feat = np.mean(cluster_features, axis=0)
+            cluster_feat = cluster_feat / np.linalg.norm(cluster_feat)
+
+            distinct_scores = cluster_features @ cluster_feat.T
+            if encoded_query is not None:
+                image_scores = cluster_features @ encoded_query.T
+                distinct_scores += image_scores
+            closest_image = cluster_images[np.argmax(distinct_scores)]
+            chunk.append(closest_image)
+
+    # sort the images by the order they appear in the segment
+    chunk = sorted(
+        chunk, key=lambda x: image_srcs.index(x if isinstance(x, str) else x.src)
+    )
+    return chunk
+
+
+lambda1 = 0.5
+lambda2 = 1 - lambda1
+
+
+def expand_single_image(
+    data: Data,
+    query: str,
+    seed: str,
+    start: str,
+    end: str,
+):
+    """
+    Find a segment of images that are similar to the seed image,
+    starting from the start image and ending at the end image.
+    The segment is expanded left and right from the seed image,
+    until the similarity drops below a threshold.
+    """
+    # Expand left and right from the seed, with fixed boundaries
+    model = get_model(data)
+    photo_ids = model.photo_ids(data)
+    seed_index = photo_ids.index(seed)
+    start_index = max(photo_ids.index(start), 0)
+    end_index = min(photo_ids.index(end), len(photo_ids) - 1)
+
+    photo_feat = model.photo_features(data)[seed_index]
+
+    # Expand left and right
+    left = 0
+    right = 0
+    while seed_index - left > start_index:
+        left_feat = model.photo_features(data)[seed_index - left]
+        sim = photo_feat @ left_feat.T
+        if sim < 0.9:
+            break
+        left += 1
+        photo_feat = left_feat
+
+    photo_feat = model.photo_features(data)[seed_index]
+    while seed_index + right < end_index:
+        right_feat = model.photo_features(data)[seed_index + right]
+        sim = photo_feat @ right_feat.T
+        if sim < 0.9:
+            break
+        right += 1
+        photo_feat = right_feat
+
+    return photo_ids[seed_index - left], photo_ids[seed_index + right]

@@ -23,7 +23,7 @@ from query_parse.types.elasticsearch import (
     VisualInfo,
 )
 from query_parse.types.lifelog import Mode, TimeCondition
-from visual.main import siglip_model, clip_model
+from visual.main import siglip_model
 
 
 def range_filter(
@@ -346,8 +346,7 @@ def get_visual_filters(visual_info: VisualInfo, embed_model: str = "sigclip"
             case "sigclip":
                 encoded_query = siglip_model.encode_text(visual_info.text).tolist()
             case _:
-                encoded_query = clip_model.encode_text(visual_info.text).tolist()
-
+                raise ValueError(f"Unknown embedding model: {embed_model}")
 
         embedding.embedding = encoded_query
         ocr.query = visual_info.text

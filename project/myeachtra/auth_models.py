@@ -68,13 +68,7 @@ def create_users() -> None:
     #     data_access=[Data.LSC23, Data.Deakin],
     # )
     # create_user(admin, overwrite=True)
-    dres = CreateUserRequest(
-        username="deakin",
-        password="wceating",
-        data_access=[Data.Deakin],
-    )
-    create_user(dres, overwrite=True)
-
+    pass
 
 create_users()
 

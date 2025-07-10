@@ -5,7 +5,7 @@ from typing import List, Tuple
 import numpy as np
 import open_clip
 import torch
-from configs import CLIP_EMBEDDINGS, IMAGE_DIRECTORY, MODEL_NAME, PRETRAINED_DATASET
+from configs import CLIP_EMBEDDINGS, FORCE_CPU, IMAGE_DIRECTORY, MODEL_NAME, PRETRAINED_DATASET
 from numpy import linalg as LA
 from open_clip.model import CLIP
 from open_clip.tokenizer import _tokenizer
@@ -16,6 +16,7 @@ from retrieval.async_utils import async_timer, timer
 from rich import print
 from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.auto.processing_auto import AutoProcessor
+from transformers.utils.quantization_config import BitsAndBytesConfig
 
 from visual.features import SIGLIP_FEATURES, VIT14_CLIP_FEATURES
 from visual.querybank_norm import apply_qb_norm_to_query, get_retrieved_videos
@@ -24,6 +25,7 @@ from visual.temporal_feat_extract import (
     get_time_info,
     map_matrix_to_photos,
 )
+from visual.low_visual import np_blurred_indices
 from visual.types import Array1D
 
 # MODEL_NAME = "ViT-L-14-336"
@@ -35,7 +37,7 @@ from visual.types import Array1D
 
 # Load CLIP Model
 device = "cpu"
-if torch.cuda.is_available():  # type: ignore
+if not FORCE_CPU and torch.cuda.is_available():
     device = "cuda"
 
 THRESHOLD = 0.0403
@@ -131,12 +133,12 @@ class ClipModel:
 
     def score_all_images(
         self, query: str, data: Data
-    ) -> Tuple[List[float], np.ndarray]:
+    ) -> Tuple[Array1D[np.float32], Array1D[np.float32]]:
         encoded_query = self.encode_text(query, normalize=True)
         similarity = self.features[data].embeddings @ encoded_query.T
         similarity = similarity.reshape(-1)
         # similarity[np.where(similarity < 0.1)] = 0
-        return similarity.astype("float").tolist(), encoded_query
+        return similarity, encoded_query
 
     def find_similar_images(self, image_path: str, data: Data) -> Array1D:
         encoded_image = self.encode_image(image_path, data)
@@ -167,12 +169,17 @@ def normalize_scores(scores: Array1D[np.float32]) -> Array1D[np.float32]:
         return scores
     return (scores - np.min(scores)) / (np.max(scores) - np.min(scores))
 
+bnb_config = BitsAndBytesConfig(load_in_4bit=True)
+
 class SIGLIP(ClipModel):
     def __init__(self):
         self.name = "siglip"
         model = AutoModel.from_pretrained(
             "google/siglip-so400m-patch14-384",
             device_map=device,
+            attn_implementation="sdpa",
+            quantization_config=bnb_config,
+
         )
         processor = AutoProcessor.from_pretrained(
             "google/siglip-so400m-patch14-384",
@@ -280,18 +287,26 @@ class SIGLIP(ClipModel):
         self, data, query: SingleQuery, exclude: set[int] = set(),
         visual_only: bool = False
     ):
-        if not self.lsc25_feat_loaded:
+        if data == Data.LSC23 and not self.lsc25_feat_loaded:
             self.load_lsc25_feat()
 
-        encoded_query = self.encode_text(query.full_text, normalize=True)
-        # Apply query bank normalization
-        similarities = apply_qb_norm_to_query(
-            encoded_query,
-            self.features[data].embeddings,
-            self.retrieved_videos,
-            self.normalizing_sum,
-            self.beta,
-        )
+        if data != Data.LSC23:
+            similarities, _ = self.score_all_images(
+                query.full_text,
+                data
+            )
+            visual_only = True
+        else:
+            encoded_query = self.encode_text(query.full_text, normalize=True)
+            # Apply query bank normalization
+            similarities = apply_qb_norm_to_query(
+                encoded_query,
+                self.features[data].embeddings,
+                self.retrieved_videos,
+                self.normalizing_sum,
+                self.beta,
+            )
+
         # similarities[np.where(similarities < THRESHOLD)] = 0
         similarities = normalize_scores(similarities)
 
@@ -343,10 +358,12 @@ class SIGLIP(ClipModel):
             # Apply filters to the similarities
             similarities[np.array(list(exclude))] = 0
 
+        similarities[np_blurred_indices[data]] = 0
+
         return similarities
 
 
-clip_model = ClipModel()
+# clip_model = ClipModel()
 siglip_model = SIGLIP()
 
 # clip_model.load_data()
@@ -355,15 +372,17 @@ siglip_model.load_lsc25_feat()
 
 
 def get_model(data: Data):
-    if data == Data.LSC23:
-        return siglip_model
-    elif data == Data.Deakin:
-        return siglip_model
+    return siglip_model
+    # if data == Data.LSC23:
+    #     return siglip_model
+    # elif data == Data.Deakin:
+    #     return siglip_model
 
 
 def get_model_by_name(name: str):
     if name == "clip":
-        return clip_model
+        raise NotImplementedError("CLIP model is not implemented in this version.")
+        # return clip_model
     elif name == "siglip":
         return siglip_model
     else:

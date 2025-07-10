@@ -60,15 +60,13 @@ from rich import print
 from visual import encode_text
 from visual.features import SIGLIP_FEATURES
 from visual.main import get_model
+from visual.segments import get_keyframes_from_segments
 
 from retrieval.async_utils import async_generator_timer, async_timer
-from retrieval.dynamic_segmentation import (
-    get_keyframes_from_segments,
-    get_segments_related_to_text,
-)
 from retrieval.graph_utils import get_heatmap_data
 from retrieval.lsc25 import (
     get_segments_from_similarity_scores,
+    get_segments_related_to_text,
     lsc25_get_segments,
     lsc25_multi_queries,
 )
@@ -197,9 +195,12 @@ async def simple_search(
     # The scores are on a x-axis of time
     # We can visualize the scores in a heatmap like git commit history
     # of the scores
-    visualisation_data = get_heatmap_data(
-        data, segment_res.scores, segment_res.high_score_indices
-    )
+    if data == Data.LSC23:
+        visualisation_data = get_heatmap_data(
+            data, segment_res.scores, segment_res.high_score_indices
+        )
+    else:
+        visualisation_data = []
     # filter_fields = main_query.filters
     # if filter_fields and filter_fields.patient_id:
     #     visualisation_data.extend(
@@ -253,7 +254,7 @@ def search_metadata(data, request):
     return images, mongo_scores
 
 
-def get_segments_only(
+async def get_segments_only(
     main_text: str, filters: EatingFilters, data: Data
 ) -> Tuple[List[Event], int, List[bool], HeatmapResults | None]:
     """
@@ -286,7 +287,7 @@ def get_segments_only(
 
     print("[green]Images found[/green]", len(images))
     # segment_res = get_segments(main_text, data, max_gap=5, filters=images, to_merge=True)
-    segment_res = get_segments_related_to_text(main_text, data, filters=images)
+    segment_res = await get_segments_related_to_text(main_text, data, filters=images)
     eating = []
     if not segment_res["segments"]:
         print("[red]No segments found[/red]")
@@ -532,7 +533,7 @@ async def perform_full_search(
             [
                 FunctionWithArgs(
                     function=limit_images_per_event,
-                    args=[results, text, pipeline.image_limiter.output["max_images"]],
+                    args=[results, text, pipeline.image_limiter.output["max_images"], data],
                     output_name="results",
                 )
             ]
@@ -583,6 +584,7 @@ async def perform_full_search(
     print("[yellow]Answering the question...[/yellow]")
     all_answers = AnswerListResult()
     async for answers in get_answer_tasks(
+        data,
         text, results, relevant_fields.relevant_fields
     ):
         for answer in answers:
@@ -622,6 +624,7 @@ def get_search_tasks(
 
 
 async def get_answer_tasks(
+    data: Data,
     text: str,
     results: TripletEventResults,
     relevant_fields: List[str],
@@ -648,7 +651,7 @@ async def get_answer_tasks(
     textual_descriptions = []
     for event in results.events[:k]:
         textual_descriptions.append(
-            get_specific_description(event.main, relevant_fields)
+            get_specific_description(data, event.main, relevant_fields)
         )
 
     if not textual_descriptions:

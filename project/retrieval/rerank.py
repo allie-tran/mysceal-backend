@@ -62,7 +62,7 @@ class Reranker:
             messages, tokenize=False, add_generation_prompt=True
         )
         inputs = self.processor(text=text, images=[collage], return_tensors="pt").to(
-            "cuda"
+            device
         )
 
         # Run inference to obtain logits
@@ -103,5 +103,5 @@ class Reranker:
 
 
 # reranker = None
-reranker = Reranker(processor_path, model)
-print("Reranker initialized")
+# reranker = Reranker(processor_path, model)
+# print("Reranker initialized")

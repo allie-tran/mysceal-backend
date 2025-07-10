@@ -17,7 +17,7 @@ memory = Memory(location="cache", verbose=0)
 # ====================== #
 # These could be adjusted in the frontend with settings
 DEV_MODE = False
-USE_GROQ = False
+USE_GROQ = True
 DEBUG = False
 CACHE = True
 
@@ -79,7 +79,9 @@ SCENE_INDEX = os.getenv("SCENE_INDEX", "all_lsc_mean")
 # Functions to derive fields #
 # ========================== #
 ESSENTIAL_FIELDS = ["images", "scene", "group", "start_time", "end_time", "gps", "time", "local_time", "timezone"]
+
 IMAGE_ESSENTIAL_FIELDS = [
+    "snap",
     "image",
     "time",
     "gps",
@@ -88,7 +90,10 @@ IMAGE_ESSENTIAL_FIELDS = [
     "location",
     "aspect_ratio",
     "hash_code",
+    "local_time",
     "icon",
+    "timezone",
+    "person"
 ]
 
 DEPENDENCIES = {"place": ["location"], "place_info": ["location"]}

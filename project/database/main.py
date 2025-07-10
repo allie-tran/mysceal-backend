@@ -6,6 +6,7 @@ client = MongoClient("localhost", 27017)
 
 LSC_DB = client["LSC24_new"]
 DEAKIN_DB = client["sherlock"]
+CASTLE_DB = client["castle"]
 
 def get_db(db_name: Data):
     match db_name:
@@ -13,6 +14,8 @@ def get_db(db_name: Data):
             return LSC_DB
         case Data.Deakin:
             return DEAKIN_DB
+        case Data.CASTLE:
+            return CASTLE_DB
 
 def create_text_index(db, collection_name):
     # For captions field
@@ -20,7 +23,7 @@ def create_text_index(db, collection_name):
 
 try:
     # create_text_index(LSC_DB, "images")
-    create_text_index(DEAKIN_DB, "images")
+    create_text_index(DEAKIN_DB, "castle")
 except Exception as e:
     print(e)
 

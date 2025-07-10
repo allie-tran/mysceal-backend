@@ -7,7 +7,6 @@ from configs import (
     EXCLUDE_FIELDS,
     ISEQUAL,
     MAXIMUM_EVENT_TO_GROUP,
-    RERANK,
     SORT_VALUES,
 )
 from database.main import get_db, image_collection, scene_collection
@@ -15,8 +14,7 @@ from pydantic import BaseModel, InstanceOf, validate_call
 from query_parse.types.lifelog import MaxGap, RelevantFields
 from query_parse.types.requests import Data
 from visual.main import get_model, score_images
-from retrieval.dynamic_segmentation import get_keyframes_from_segments
-from retrieval.rerank import reranker
+from visual.segments import get_keyframes_from_segments
 from rich import print
 
 from results.models import Event, EventResults, GenericEventResults, Image, TripletEvent, TripletEventResults
@@ -53,7 +51,7 @@ def deriving_fields(
     for event in events:
         derived_event = event.copy_to_derived_event()
         for field in fields:
-            if field in field_dict[field]:
+            if field in field_dict and event.scene in field_dict[field]:
                 setattr(derived_event, field, field_dict[field][event.scene])
             else:
                 setattr(derived_event, field, DERIVABLE_FIELDS[field](event))
@@ -504,7 +502,7 @@ def limit_images_per_event(
     return results
 
 
-def basic_label(event: Event) -> str:
+def basic_label(event: Event, data: Data) -> str:
     """
     Create a basic label for the event
     """
@@ -520,7 +518,15 @@ def basic_label(event: Event) -> str:
         location = event.user_id
     date = event.start_time.strftime("%d, %b %Y")
     timezone = event.timezone if event.timezone else "UTC"
-    return f"<strong>{location}</strong>\n{date}, {time}, {timezone}"
+
+    if data == Data.LSC23:
+        return f"<strong>{location}</strong>\n{date}, {time}, {timezone}"
+    elif data == Data.Deakin:
+        return f"<strong>{location}</strong>\n{date}, {time}\nUser ID: {event.user_id}"
+    else:
+        day = event.start_time.strftime("%A")
+        person = event.user_id if event.user_id else "Unknown"
+        return f"<strong>{location}</strong>\n{date}, {day}, {time}\nPerson: {person}"
 
 
 def create_event_label(
@@ -533,9 +539,13 @@ def create_event_label(
         # Get the basic fields: location, time, date
         for generic_event in results.events:
             for event in generic_event.custom_iter():
-                event.name = basic_label(event)
+                event.name = basic_label(event, data)
     else:
         all_fields = set(relevant_fields)
+        if data in [Data.Deakin, Data.CASTLE]:
+            all_fields.discard("location")
+            all_fields.add("user_id")
+
         done = set()
 
         # We have to go from specific to general
@@ -583,7 +593,7 @@ def create_event_label(
                 if field in all_fields:
                     filtered_fields["location"].append(field)
 
-        if data == Data.Deakin:
+        if data == Data.Deakin or data == Data.CASTLE:
             # replace location with user_id
             if "user_id" in all_fields:
                 filtered_fields["location"].append("user_id")

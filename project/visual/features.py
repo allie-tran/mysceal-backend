@@ -1,9 +1,9 @@
 import os
+
 import numpy as np
 import pandas as pd
-from numpy import linalg as LA
-
 from configs import CLIP_EMBEDDINGS
+from numpy import linalg as LA
 from query_parse.types.requests import Data
 
 
@@ -41,6 +41,11 @@ def load_features(paths):
     )
 
     list_photo_ids: list[str] = photo_ids.tolist()
+    print(list_photo_ids[:10])
+    print(
+        "day2/Florian/17_866.webp" in list_photo_ids,
+        "day2/Florian/17_866.webp" in photo_ids,
+    )
 
     image_to_id = {image: i for i, image in enumerate(list_photo_ids)}
     print(
@@ -90,9 +95,17 @@ SIGLIP_FEATURES = {
             f"{CLIP_EMBEDDINGS}/Deakin/siglip-so400m-patch14-384",
         ]
     ),
+    Data.CASTLE: CLIPFeature(
+        [
+            f"{CLIP_EMBEDDINGS}/CASTLE/siglip-so400m-patch14-384",
+        ]
+    ),
 }
 
 VIT14_CLIP_FEATURES = {
     Data.LSC23: CLIPFeature([f"{CLIP_EMBEDDINGS}/LSC23/ViT-L-14-336_openai_nonorm"]),
     Data.Deakin: None,
+    Data.CASTLE: None,
 }
+
+SIGLIP_FEATURES[Data.CASTLE].load()

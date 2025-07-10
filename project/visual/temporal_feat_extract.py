@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from llm import gpt_llm_model as gpt
+from llm import llm_model
 from retrieval.scripts import (
     TIME_BUCKETS,
     TIME_TO_IDX,
@@ -117,7 +117,7 @@ Use this JSON format:
 
 # %%
 async def get_time_heatmap(phrase) -> Array2D[np.float32] | None:
-    heatmap_json = await gpt.generate_from_text(
+    heatmap_json = await llm_model.generate_from_text(
         heatmap_prompt.format(phrase=phrase, script=script),
         model="gpt-4o"
     )

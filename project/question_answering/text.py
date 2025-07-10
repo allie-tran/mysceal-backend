@@ -7,11 +7,12 @@ from configs import DURATION_FIELDS, LOCATION_FIELDS, TIME_FIELDS
 from llm import llm_model
 from llm.prompts import QA_PROMPT
 from query_parse.time import calculate_duration
+from query_parse.types.requests import Data
 from results.models import AnswerListResult, AnswerResult, Event
 from rich import print as rprint
 
 
-def get_general_textual_description(event: Event) -> str:
+def get_general_textual_description(data: Data, event: Event) -> str:
     # Default values
     time = ""
     duration = ""
@@ -51,17 +52,27 @@ def get_general_textual_description(event: Event) -> str:
     if event.ocr:
         ocr = f"Some texts that can be seen from the images are: {' '.join(event.ocr)}."
 
-    textual_description = (
-        f"The event happened {time}{duration} on {date} "
-        + f"{location}{location_info} in {region} in {event.country}. {ocr}"
-    )
+    if data == Data.LSC23:
+        textual_description = (
+            f"The event happened {time}{duration} on {date} "
+            + f"{location}{location_info} in {region} in {event.country}. {ocr}"
+        )
+    elif data == Data.Deakin:
+        textual_description = (
+            f"The event happened {time}{duration} on {date}. This is from patient {event.user_id} "
+        )
+    elif data == Data.CASTLE:
+        date = event.start_time.strftime("%d")
+        textual_description = (
+            f"The event is seen from {event.user_id}'s POV camera, happened {time}{duration} on day {date} "
+        )
     return textual_description
 
 
 # Get textual description for a scene
-def get_specific_description(event: Event, fields: Optional[List[str]] = None) -> str:
+def get_specific_description(data: Data, event: Event, fields: Optional[List[str]] = None) -> str:
     if fields is None:
-        return get_general_textual_description(event)
+        return get_general_textual_description(data, event)
 
     # Default values
     time = ""
@@ -102,7 +113,20 @@ def get_specific_description(event: Event, fields: Optional[List[str]] = None) -
             f"Some texts that can be seen from the images are: {' '.join(event.ocr)}."
         )
 
-    textual_description = f"This event happened{time}{duration}{location}. {visual}"
+    match data:
+        case Data.LSC23:
+            textual_description = f"This event happened{time}{duration}{location}. {visual}"
+        case Data.Deakin:
+            textual_description = (
+                f"This event happened{time}{duration} for patient {event.user_id}. {visual}"
+            )
+        case Data.CASTLE:
+            date = event.start_time.strftime("%d")
+            textual_description = (
+                f"This event is seen from {event.user_id}'s POV camera, happened{time}{duration} on day {date}. {visual}"
+            )
+        case _:
+            raise ValueError(f"Unsupported data type: {data}")
     return textual_description
 
 

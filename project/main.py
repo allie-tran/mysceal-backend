@@ -1,8 +1,9 @@
 import json
+from datetime import datetime
 import logging
+import os
 from contextlib import asynccontextmanager
 from io import BytesIO
-import os
 from typing import List, Optional
 from uuid import uuid4
 
@@ -24,7 +25,13 @@ from database.segments import (
     get_saved_segments,
     save_segments_to_db,
 )
-from database.utils import get_full_data, get_image_counts_per_date, get_segment_counts_per_date, get_unique_patient_ids, get_unique_values
+from database.utils import (
+    get_full_data,
+    get_image_counts_per_date,
+    get_segment_counts_per_date,
+    get_unique_patient_ids,
+    get_unique_values,
+)
 from myeachtra.auth_models import get_user, verify_user
 from myeachtra.map_router import map_router
 from myeachtra.timeline_router import timeline_router
@@ -44,23 +51,34 @@ from query_parse.types.requests import (
     SimilaritySearchRequest,
 )
 from results.lifelog_questions import create_video
-from results.models import AnswerResultWithEvent, EventResults, TripletEventResults
-from retrieval.dynamic_segmentation import (
-    expand_single_image,
-    get_keyframes_from_segments,
-)
+from results.models import AnswerResultWithEvent, TripletEventResults
 from retrieval.graph import get_vegalite, to_csv
-from retrieval.search import answer_single_event, get_segments_only, search_similar_events, streaming_manager
+from retrieval.search import (
+    answer_single_event,
+    get_segments_only,
+    search_similar_events,
+    streaming_manager,
+)
 from submit.router import submit_router
 from visual.main import get_model
+from visual.segments import expand_single_image, get_keyframes_from_segments
 
 logging.basicConfig(level=logging.DEBUG)
 
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-load_dotenv(".env")
+logger.setLevel(logging.WARNING)
 
+# Set root logger to WARNING (or INFO if you still want some output)
+logging.basicConfig(level=logging.WARNING)
+
+# Optional: Silence noisy submodules
+logging.getLogger("pyrate_limiter").setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+
+load_dotenv(".env")
 
 @asynccontextmanager
 async def start_up(_: FastAPI):
@@ -176,6 +194,7 @@ async def answer_this(request: AnswerThisRequest):
         answers.append(answer)
     return answers
 
+
 @app.post(
     "/similarity-search",
     description="Search for similar images",
@@ -186,10 +205,7 @@ async def similarity_search(request: SimilaritySearchRequest):
     """
     Search for similar images based on a query
     """
-    return await search_similar_events(
-        request.image,
-        request.data
-    )
+    return await search_similar_events(request.image, request.data)
 
 
 @app.post(
@@ -264,7 +280,9 @@ async def get_choices(request: ChoicesRequest):
                 for date in choices:
                     if date in segment_counts:
                         length, eating = segment_counts[date]
-                        annotations.append(f"{date} ({length} segments, {eating} eating)")
+                        annotations.append(
+                            f"{date} ({length} segments, {eating} eating)"
+                        )
                     else:
                         img_count = image_counts.get(date, 0)
                         annotations.append(f"{date} ({img_count} images)")
@@ -296,7 +314,7 @@ async def get_segments(request: SegmentRequest):
             return saved_segments
 
     query = "I am eating, or preparing food, or food (or drink) is visible"
-    events, num, eating, heatmap = get_segments_only(
+    events, num, eating, heatmap = await get_segments_only(
         query,
         EatingFilters(patient_id=[request.patient_id], date=[request.date]),
         data=request.data,
@@ -312,7 +330,7 @@ async def get_segments(request: SegmentRequest):
                 ),
                 keyframes=get_keyframes_from_segments(
                     encoded_query, request.data, event.images
-                ),
+                )
             )
         )
 
@@ -323,7 +341,7 @@ async def get_segments(request: SegmentRequest):
         count=num,
         heatmap=heatmap,
     )
-    save_segments_to_db(request.data, results, skip_merge=True)
+    save_segments_to_db(request.data, results, skip_merge=False)
     return results
 
 
@@ -378,7 +396,7 @@ async def toogle_eating(request: ExpandSegmentRequest):
                         patient_id=request.patient_id,
                         date=request.date,
                         segments=new_segments,
-                        manually_checked=True
+                        manually_checked=True,
                     ),
                 )
                 return segments.segments
@@ -465,12 +483,15 @@ async def toogle_eating(request: ExpandSegmentRequest):
         save_segments_to_db(
             request.data,
             EventSegments(
-                patient_id=request.patient_id, date=request.date, segments=new_segments,
+                patient_id=request.patient_id,
+                date=request.date,
+                segments=new_segments,
                 manually_checked=True,  # Set to True to indicate manual changes
-
             ),
         )
         return new_segments
+
+
 
     print("Image not found in segments")
     raise HTTPException(
@@ -546,11 +567,14 @@ async def annotate_segments(request: SegmentRequest):
     save_segments_to_db(
         request.data,
         EventSegments(
-            patient_id=request.patient_id, date=request.date, segments=segments,
+            patient_id=request.patient_id,
+            date=request.date,
+            segments=segments,
         ),
         skip_merge=True,
     )
     return segments
+
 
 @app.post("/edit-annotations", description="Edit annotations", status_code=200)
 async def edit_annotations(request: EditAnnotationRequest):
@@ -595,6 +619,7 @@ async def edit_annotations(request: EditAnnotationRequest):
     save_segments_to_db(request.data, segments, skip_merge=True)
     return segments
 
+
 @app.post("/download-segments", description="Download segments", status_code=200)
 async def download_segments(request: SegmentRequest):
     """
@@ -613,18 +638,25 @@ async def download_segments(request: SegmentRequest):
     # Write it into a CSV file with the following columns:
     # Patient ID, Date, Image, Eating, Segment ID, [all other fields]
     data = []
+    def image_to_time(image_src: str) -> str:
+        "ID100_20211209_072207_000"
+        _, time = image_src.split("_", 1)[-1]
+        return datetime.strptime(time, "%Y%m%d_%H%M%S_%f").strftime("%H:%M %d-%m-%Y")
+
     for i, segment in enumerate(event_segments.segments):
-        for image in segment.images:
-            row = {
-                "Patient ID": request.patient_id,
-                "Date": request.date,
-                "Image": image.src,
-                "Segment ID": f"{request.patient_id}_{request.date}_{i:03d}",
-                "Eating": segment.annotations.eating,
-            }
-            row.update(segment.annotations.model_dump())
-            row = {to_title_case(k): v for k, v in row.items()}
-            data.append(row)
+        if segment.annotations.eating:
+            for image in segment.images:
+                row = {
+                    "Patient ID": request.patient_id,
+                    "Date": request.date,
+                    "Time": image_to_time(image.src),
+                    "Image": image.src,
+                    "Segment ID": f"{request.patient_id}_{request.date}_{i:03d}",
+                    "Eating": segment.annotations.eating,
+                }
+                row.update(segment.annotations.model_dump())
+                row = {to_title_case(k): v for k, v in row.items()}
+                data.append(row)
 
     # Write to CSV
     file = BytesIO()
@@ -637,9 +669,8 @@ async def download_segments(request: SegmentRequest):
         headers={"Content-Disposition": "attachment; filename=segments.csv"},
     )
 
-@app.post("/export-to-video",
-    description="Export segments to video",
-    status_code=200)
+
+@app.post("/export-to-video", description="Export segments to video", status_code=200)
 async def export_to_video(request: List[str]):
     """
     Export segments to video
@@ -655,10 +686,11 @@ async def export_to_video(request: List[str]):
     headers = {
         "Content-Length": str(file_size),
         "Content-Type": "video/mp4",
-        "Accept-Ranges": "bytes"
+        "Accept-Ranges": "bytes",
     }
 
     return StreamingResponse(iterfile(), headers=headers, media_type="video/mp4")
+
 
 def to_title_case(string: str) -> str:
     return " ".join([word.capitalize() for word in string.split("_")])

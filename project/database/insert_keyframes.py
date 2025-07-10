@@ -3,7 +3,7 @@ from tqdm.auto import tqdm
 from database.main import get_db, scene_collection
 from query_parse.types.requests import Data
 from results.models import Image
-from retrieval.dynamic_segmentation import get_keyframes_from_segments
+from visual.segments import get_keyframes_from_segments
 
 def insert_keyframes(data: Data):
     db = get_db(data)

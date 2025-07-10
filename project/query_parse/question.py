@@ -6,7 +6,7 @@ import re
 from typing import Dict, List, TypedDict
 
 from configs import QUERY_PARSER
-from llm import small_llm_model, gpt_llm_model as llm_model
+from llm import small_llm_model, llm_model
 from llm.prompt.parse import QUERY_PARSE_PROMPT, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION, SPLIT_QUERY_PROMPT
 from rich import print as rprint
 
