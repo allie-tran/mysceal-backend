@@ -100,6 +100,7 @@ SIGLIP_FEATURES = {
             f"{CLIP_EMBEDDINGS}/CASTLE/siglip-so400m-patch14-384",
         ]
     ),
+    # Data.CASTLE: CLIPFeature([f"{CLIP_EMBEDDINGS}/CASTLE/blip2_lavis"]),
 }
 
 VIT14_CLIP_FEATURES = {

@@ -11,7 +11,7 @@ from configs import (
 )
 from database.main import get_db, image_collection, scene_collection
 from pydantic import BaseModel, InstanceOf, validate_call
-from query_parse.types.lifelog import MaxGap, RelevantFields
+from query_parse.types.lifelog import MaxGap, RelevantFields, TimeGap
 from query_parse.types.requests import Data
 from visual.main import get_model, score_images
 from visual.segments import get_keyframes_from_segments
@@ -121,6 +121,9 @@ def custom_compare_function(
     equal = True
     ignore_fields = []
 
+    if event1.user_id != event2.user_id:
+        return 1 if str(event1.user_id) > str(event2.user_id) else -1
+
     # Check the time gap
     if max_gap and max_gap.time_gap is not None and max_gap.time_gap.unit == "none":
         time_gap = max_gap.time_gap
@@ -162,6 +165,10 @@ def custom_compare_function(
             case _:
                 pass
 
+        if not equal:
+            # If the time gap is not equal then return
+            return 1 if event1.start_time > event2.start_time else -1
+
     # Check the location gap
     if max_gap and max_gap.gps_gap is not None and max_gap.gps_gap.unit == "none":
         pass
@@ -193,7 +200,7 @@ def custom_compare_function(
         return 0
 
     # If the two events are not the same group then compare the sceneid
-    return 1 if event1.scene > event2.scene else -1
+    return 1 if event1.start_time > event2.start_time else -1
 
 
 @validate_call
@@ -213,7 +220,7 @@ def merge_events(
     available_fields = set(type(results.events[0]).model_fields)
     derive_fields = []
     to_remove = set()
-    for criteria in set(relevant_fields.merge_by + ["date"]):
+    for criteria in set(relevant_fields.merge_by + ["date", "user_id"]):
         if criteria not in available_fields:
             # Two cases here:
             # 1. the field is derivable from the schema
@@ -242,11 +249,17 @@ def merge_events(
 
     # If groupby is empty then group by "group"
     if not groupby:
-        groupby = set(["group"])
+        groupby = set(["group", "date"])
     else:
         groupby.add("date")
 
-    cmp = lambda x, y: custom_compare_function(x, y, groupby, relevant_fields.max_gap)
+    max_gap = relevant_fields.max_gap
+    if data == Data.CASTLE:
+        max_gap = MaxGap(
+            time_gap=TimeGap(value=1, unit="hour"),
+        )
+        groupby.add("user_id")
+    cmp = lambda x, y: custom_compare_function(x, y, groupby, max_gap)
 
     # Group the events using the ISEQUAL criteria from configs
     unique_groups = 0
@@ -467,37 +480,39 @@ def limit_images_per_event(
         for event in generic_event.custom_iter():  # might be a doublet or triplet
             images: List[Image] = event.images
             keyframes = get_keyframes_from_segments(encoded_query, data, event.images)
-            scores = event.image_scores
+            event.keyframes = keyframes
+
 
             if len(images) <= max_images:
                 continue
 
-            image_sources = [img.src for img in images]
-            visual_scores = score_images(
-                image_sources, encoded_query, chosen_model=get_model(data),
-                data=data
-            )
+            if max_images > 0:
+                scores = event.image_scores
+                image_sources = [img.src for img in images]
+                visual_scores = score_images(
+                    image_sources, encoded_query, chosen_model=get_model(data),
+                    data=data
+                )
 
-            # Sort the images by the visual score and the original score
-            ensembled_scores = [
-                (visual_score + 1) * (score + 1)
-                for visual_score, score in zip(visual_scores, scores)
-            ]
+                # Sort the images by the visual score and the original score
+                ensembled_scores = [
+                    (visual_score + 1) * (score + 1)
+                    for visual_score, score in zip(visual_scores, scores)
+                ]
 
-            sorted_images = [
-                x for _, x in sorted(zip(ensembled_scores, image_sources), reverse=True)
-            ]
-            chosen_images = sorted_images[:max_images]
-            indices = sorted([image_sources.index(image) for image in chosen_images])
+                sorted_images = [
+                    x for _, x in sorted(zip(ensembled_scores, image_sources), reverse=True)
+                ]
+                chosen_images = sorted_images[:max_images]
+                indices = sorted([image_sources.index(image) for image in chosen_images])
 
-            new_images = [images[i] for i in indices]
-            new_scores = [scores[i] for i in indices]
+                new_images = [images[i] for i in indices]
+                new_scores = [scores[i] for i in indices]
 
-            # Update the event
-            assert len(images) > 0, "No images"
-            event.images = new_images
-            event.image_scores = new_scores
-            event.keyframes = keyframes
+                # Update the event
+                assert len(images) > 0, "No images"
+                event.images = new_images
+                event.image_scores = new_scores
 
     return results
 

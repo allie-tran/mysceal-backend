@@ -162,7 +162,7 @@ def segment_to_event(
 def segments_to_events(
     data: Data,
     segments: Union[List[Tuple[int, int]], List[List[str]]],
-    scores,
+    scores: None | List[float] | List[int],
     photo_ids: List[str],
     relevant_fields: Optional[List[str]] = None,
 ) -> List[Event]:
@@ -172,15 +172,11 @@ def segments_to_events(
     db = get_db(data)
     images = []
     for segment in segments:
-        if isinstance(segment, list):
+        if isinstance(segment, list) and isinstance(segment[0], str):
             images.extend(segment)
         else:
             start, end = segment
             images.extend(photo_ids[start:end])
-
-    print(len(images), "images to process")
-    print(images[0:10], "first 10 images")
-
     documents = []
 
     if relevant_fields:
@@ -197,13 +193,19 @@ def segments_to_events(
             {"image": {"$in": images}}, projection=IMAGE_ESSENTIAL_FIELDS
         )
     image_to_doc = {doc["image"]: doc for doc in documents}
-    print(
-        f"Found {len(image_to_doc)} documents for {len(images)} images in the database"
-    )
+
+    # DEBUG: print images not found in the database
+    not_found_images = [img for img in images if img not in image_to_doc]
+
+    if not_found_images:
+        rprint("[red]Images not found in the database:[/red]", len(not_found_images))
+
     events = []
+    if scores is None:
+        scores = [1.0] * len(segments)
     for segment, score in zip(segments, scores):
         images = []
-        if isinstance(segment, list):
+        if isinstance(segment, list) and isinstance(segment[0], str):
             images = segment
         else:
             start, end = segment
@@ -219,8 +221,9 @@ def segments_to_events(
             event.merge_with_many(score, rest, [score] * len(rest))
         events.append(event)
 
-    for event in events:
-        event.markers, event.orphans = calculate_markers(event)
+    if data == Data.LSC23:
+        for event in events:
+            event.markers, event.orphans = calculate_markers(event)
 
     return events
 
@@ -254,22 +257,23 @@ def calculate_markers(event: Event) -> Tuple[List[Marker], List[GPS]]:
 
 
 @async_timer("get_relevant_fields")
-async def get_relevant_fields(query: str, tag: str) -> AsyncioTaskResult:
+async def get_relevant_fields(data: Data, query: str, tag: str) -> AsyncioTaskResult:
     """
     Get the relevant fields from the query
     """
     prompt = RELEVANT_FIELDS_PROMPT.format(query=query)
-    data = {}
+    fields = {}
     while True:
         try:
-            data = await llm_model.generate_from_text(prompt)
-            if data:
-                rprint("Relevant Fields", data)
+            res = llm_model.generate_from_text(data, prompt)
+            if res:
+                rprint("Relevant Fields", fields)
+                fields = res
                 break
         except ValidationError as e:
             rprint(e)
 
-    relevant_fields = RelevantFields.model_validate(data)
+    relevant_fields = RelevantFields.model_validate(fields)
     return AsyncioTaskResult(results=relevant_fields, tag=tag, task_type="llm")
 
 

@@ -1,11 +1,17 @@
 from bisect import bisect_left, bisect_right
+import requests
 from typing import List, Optional, Sequence, Set, Tuple
+import pandas as pd
+import io
+from pathlib import Path
+from PIL import Image
 
 import numpy as np
-from configs import WINDOW_SIZE
+from configs import IMAGE_DIRECTORY, WINDOW_SIZE
+from database.main import get_db, image_collection
 from database.utils import segment_to_event, segments_to_events
 from pydantic import BaseModel
-from query_parse.types.lifelog import ParsedQuery, RelevantFields, SingleQuery
+from query_parse.types.lifelog import ParsedQuery, RelevantFields, SearchFilters, SingleQuery
 from query_parse.types.requests import Data
 from results.models import TripletEvent, TripletEventResults
 from results.utils import merge_events
@@ -22,6 +28,7 @@ from visual.types import Array1D
 
 from retrieval.async_utils import async_timer, timer
 from retrieval.graph_utils import get_heatmap_from_images
+from rich import print as rprint
 
 
 class SegmentResult(BaseModel):
@@ -31,27 +38,33 @@ class SegmentResult(BaseModel):
     high_score_indices: List[int]
     events: List[TripletEvent]
 
+def search_metadata(data: Data, search_filters: SearchFilters) -> set[str]:
+    db = get_db(data)
+    criteria = search_filters.export()
+    rprint(f"[bold green]Searching metadata with criteria:[/bold green] {criteria}")
+    image_cursor = image_collection(db).find(criteria, {"image": 1})
+    images = [
+        image["image"] for image in image_cursor
+    ]
+    print(images[:10])  # Print first 10 images for debugging
+    include_only = set(images)
+    print(f"Found {len(include_only)} images matching the filters")
+    return include_only
 
 @async_timer("lsc25_get_segments")
 async def lsc25_get_segments(
+    data: Data,
     query: SingleQuery,
-    data: Data = Data.LSC23,
+    search_filters: SearchFilters,
     score_percentile: int = 99,
-    include_only: set[str] | None = None,
-    # metadata_scores: dict = {},
     top_n: int = 100,
 ) -> SegmentResult:
     model = get_model(data)
+    include_only: Optional[Set[str]] = None
+    if search_filters:
+        include_only = search_metadata(data, search_filters)
+
     similarities = await get_lsc25_scores(model, query, include_only, data)
-
-    # np_metadata_scores = np.array(
-    #     [metadata_scores.get(photo_id, 0) for photo_id in SIGLIP_FEATURES[data].ids]
-    # )
-    # max_metadata_score = np.max(np_metadata_scores)
-    # if max_metadata_score > 0:
-    #     metadata_scores = np_metadata_scores / max_metadata_score
-    #     similarities = similarities * metadata_scores
-
     return get_segments_from_similarity_scores(
         similarities, score_percentile, top_n, data
     )
@@ -64,15 +77,15 @@ def get_segments_from_similarity_scores(
     data: Data = Data.LSC23,
 ) -> SegmentResult:
     threshold = np.percentile(similarities, score_percentile)
-    threshold = max(threshold, 0.00)  # Ensure threshold is not too low
+    threshold = max(float(threshold), 0.00)  # Ensure threshold is not too low
     high_score_indices = np.where(similarities > threshold)[0].tolist()
 
-    top_indices = np.argsort(similarities)[::-1][:top_n]
+    top_indices = np.argsort(similarities)[::-1]
     top_photos = [SIGLIP_FEATURES[data].ids[i] for i in top_indices]
     top_similarities = similarities[top_indices]
 
     segments, segment_photos, segment_scores = get_segments_from_top_photos(
-        top_photos, top_similarities.tolist(), data
+        top_photos, top_similarities.tolist(), data, top_n
     )
 
     events = segments_to_events(
@@ -137,7 +150,7 @@ def get_all_segment_scores_from_scores(
     scores: List[float], data: Data = Data.LSC23
 ) -> List[float]:
 
-    segments, *_ = presegments[data]
+    segments= presegments[data].segments
     segment_scores = []
     for segment in segments:
         start, end = segment
@@ -241,7 +254,9 @@ async def lsc25_multi_queries(
     model = get_model(data)
     queries = query.queries
     main_event = query.main_event
-    segments, *_, segmented_events = presegments[data]
+    segments = presegments[data].segments
+    segmented_events = presegments[data].events
+
     N = len(queries)
 
     # Step 1: Get all scores for each query
@@ -348,15 +363,6 @@ async def lsc25_multi_queries(
                 [image for res in result[main_event + 1 :] for image in res],
             )
 
-        # check if there are no overlapping images
-        if before and after:
-            if (
-                set(before.images) & set(after.images)
-                or set(before.images) & set(main.images)
-                or set(after.images) & set(main.images)
-            ):
-                continue
-
         events.append(
             TripletEvent(
                 main=main,
@@ -433,9 +439,24 @@ async def get_segments_related_to_text(
     print(f"Score threshold: {score_threshold}")
     lower_score_threshold = np.percentile(non_zero_scores, 50)
 
+    # Get segments and photos from presegments
+    segments = presegments[data].segments
+    segment_photos = presegments[data].segment_photos
+
+    # Or use Long's code
+    # Long_segments = await get_segments_Long(
+    #     data=data,
+    #     photos=[segment_photos[i] for i in non_zeros],
+    #     first_index=segments[non_zeros[0]][0] if non_zeros.size > 0 else 0,
+    # )
+    # segments = Long_segments["segments"]
+    # segment_photos = Long_segments["photos"]
+    # print(segments[:10])  # Print first 10 segments for debugging
+
+    # Rerank segments based on the scores
     print("Reranking segments")
-    segments, segment_photos, *_ = presegments[data]
-    for i in range(len(segment_scores)):
+    lower_score_threshold = 0.3
+    for i in range(len(segments)):
         if segment_scores[i] <= 0:
             continue
 
@@ -449,6 +470,7 @@ async def get_segments_related_to_text(
         else:
             photo_scores = similarities[start:end]
             score = np.mean(photo_scores)
+            print(f"Segment {i} score: {score}, threshold: {score_threshold}")
             if score > score_threshold:
                 okay = True
             elif score > lower_score_threshold:
@@ -565,3 +587,93 @@ async def get_segments_related_to_text(
         "heatmap": heatmap,
         "high_score_indices": [],
     }
+
+
+# =========================================== #
+# Long's Codes
+def prepare_images(image_dir):
+    """
+    Prepare a list of images (PIL.Image, bytes) from the given directory.
+    """
+
+    pil_images = []
+    byte_images = []
+    image_list = list(Path(image_dir).glob("*.jpg"))
+    image_list.sort()
+    filenames = [img_path.name for img_path in image_list]
+    for img_path in image_list:
+        img = Image.open(img_path)
+        pil_images.append(img)
+        # Convert PIL image to bytes (JPEG format)
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='JPEG')
+        img_bytes.seek(0)
+        byte_images.append(img_bytes.getvalue())
+    print(f"Loaded {len(pil_images)} images from {image_dir}")
+    return pil_images, byte_images, filenames
+
+def prepare_image(image_path: str):
+    """
+    Prepare a single image (PIL.Image, bytes) from the given path.
+    """
+    img = Image.open(image_path)
+    # Convert PIL image to bytes (JPEG format)
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format='JPEG')
+    img_bytes.seek(0)
+    return image_path, img_bytes.getvalue()
+
+def send_request(results, all_photos, current_photos, first_index: int = 0):
+    API_URL = "http://lifelog.computing.dcu.ie/api/process"
+    print(f"Processing {len(current_photos)} images")
+    # Prepare files in the correct format for FastAPI
+    image_files = [("files", (filename, img_bytes, "image/jpeg")) for filename, img_bytes in current_photos]
+    response = requests.post(API_URL, files=image_files)
+    if response.status_code != 200:
+        print(f"Response text: {response.text}")
+    assert response.status_code == 200, f"API call failed with status {response.status_code}"
+    data = response.json()
+    # convert to csv
+    segments = pd.DataFrame(data['segments'])  # type: ignore
+    # segments.columns Action,Action_ID,Start Frame,End Frame,Length,Score,LogOIC,Actionness,Method
+    segments.columns = ['Action_ID', 'Start Frame', 'End Frame', 'Length', 'Score', 'LogOIC', 'Actionness', 'Action']
+
+    for _, row in segments.iterrows():
+        start = row['Start Frame']
+        end = row['End Frame']
+        results.append((start + first_index, end + first_index))
+        all_photos.append([filename for filename, _ in current_photos])
+
+    return results, all_photos
+
+
+
+async def get_segments_Long(
+    data: Data,
+    photos: List[List[str]],
+    first_index: int = 0
+):
+    print(f"Getting segments for {data} with {len(photos)} photo lists, with first index {first_index}")
+    max_images = 90
+    current_photos: list[Tuple[str, bytes]] = []
+    results = []
+    all_photos = []
+
+    for images in photos:
+        if len(current_photos) + len(images) > max_images:
+            results, all_photos = send_request(results, all_photos, current_photos, first_index)
+            current_photos = []
+
+        current_photos.extend(
+            [prepare_image(f"{IMAGE_DIRECTORY}/{data}/{img}") for img in images]
+        )
+
+    if current_photos:
+        results, all_photos = send_request(results, all_photos, current_photos, first_index)
+
+    return {
+        "segments": results,
+        "photos": all_photos
+    }
+
+

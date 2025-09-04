@@ -124,6 +124,8 @@ class Image(CamelCaseModel):
 
 class Event(CamelCaseModel):
     user_id: Optional[str] = ""
+    people_present: List[str] = Field(default_factory=list, exclude=True)
+
     data: Data = Data.LSC23
     # IDs
     group: str = ""
@@ -263,6 +265,11 @@ class Event(CamelCaseModel):
         # OCR
         self.ocr = merge_list(self.ocr, other.ocr)
 
+        # CASTLE
+        self.people_present = extend_no_duplicates(
+            self.people_present, other.people_present
+        )
+
     def merge_with_many(self, score: float, others: List["Event"], scores: List[float]):
         # Usualy the case if that the scores are descreasing
         # So we can just take the first one
@@ -307,6 +314,11 @@ class Event(CamelCaseModel):
 
         # OCR
         self.ocr = extend_with_count(self.ocr, [x.ocr for x in others])
+
+        # CASTLE
+        self.people_present = extend_no_duplicates(
+            self.people_present, [x for y in others for x in y.people_present]
+        )
 
     def copy_to_derived_event(self) -> "DerivedEvent":
         data = self.model_dump()
@@ -412,6 +424,7 @@ class AnswerResult(CamelCaseModel, revalidate_instances="always"):
     evidence: List[int] = []
     explanation: List[str] = []
     time: datetime = Field(default_factory=datetime.now, exclude=True)
+    source: str = "visual"
 
     @field_validator("evidence")
     def sort_evidence(cls, v: List[int] | List[EvidenceLink]) -> List[int]:
@@ -455,6 +468,9 @@ class AnswerListResult(CamelCaseModel, revalidate_instances="always"):
             self.answers.values(), key=lambda x: x.time
         )
         return sorted_answers
+
+    def __len__(self):
+        return len(self.answers)
 
 
 class TimelineScene(CamelCaseModel):

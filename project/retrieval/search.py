@@ -1,10 +1,12 @@
 import asyncio
+import pandas as pd
 import logging
 import time
+import requests
 from collections import defaultdict
-from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
 
 from configs import FILTER_FIELDS, WINDOW_SIZE
 from database.main import get_db, group_collection, image_collection, scene_collection
@@ -12,14 +14,12 @@ from database.models import GeneralRequestModel, Response
 from database.requests import get_es, get_parsed_output, get_request
 from database.utils import get_relevant_fields, segments_to_events
 from fastapi import HTTPException
-from llm import llm_model
-from llm.prompts import ANSWER_MODEL_CHOOSING_PROMPT
-from pydantic import BaseModel, InstanceOf, RootModel
+from pydantic import InstanceOf
 from pympler import asizeof
 from query_parse.extract_info import Query, modify_es_query
-from query_parse.question import detect_question, parse_query, question_classification
+from query_parse.question import detect_question, parse_query
 from query_parse.types.elasticsearch import TimeInfo
-from query_parse.types.lifelog import DateTuple, EatingFilters, Mode, ParsedQuery
+from query_parse.types.lifelog import DateTuple, Mode, ParsedQuery, SearchFilters
 from query_parse.types.options import FunctionWithArgs, SearchPipeline
 from query_parse.types.requests import (
     AnswerThisRequest,
@@ -31,11 +31,11 @@ from query_parse.types.requests import (
     Task,
     TimelineDateRequest,
 )
-from question_answering.text import answer_text_only, get_specific_description
-from question_answering.video import answer_visual_only, answer_visual_with_text
+from question_answering import filter_answers, get_answer_tasks
+from question_answering.text import get_specific_description
+from question_answering.video import answer_visual_with_text
 from results.models import (
     AnswerListResult,
-    AnswerResult,
     AnswerResultWithEvent,
     AsyncioTaskResult,
     DerivedEvent,
@@ -160,6 +160,7 @@ async def streaming_manager(request: GeneralQueryRequest) -> AsyncGenerator[str,
 @async_timer("simple_search")
 async def simple_search(
     query: ParsedQuery,
+    search_filters: SearchFilters,
     data: Data,
     size: int,
     tag: str = "",
@@ -170,7 +171,7 @@ async def simple_search(
     Search a single query without any fancy stuff
     """
     results = None
-    if query.multiple_queries:
+    if query.multiple_queries and data == Data.LSC23:
         print("[green]Multiple queries found[/green]")
         segment_res = await lsc25_multi_queries(
             query,
@@ -180,9 +181,11 @@ async def simple_search(
 
     else:
         segment_res = await lsc25_get_segments(
-            query.main,
             data,
+            query.main,
+            search_filters,
             top_n=size,
+            score_percentile=99 if data == Data.LSC23 else 90,
         )
 
     events = segment_res.events
@@ -220,42 +223,8 @@ async def simple_search(
     return AsyncioTaskResult(task_type="search", tag=tag, results=results)
 
 
-def search_metadata(data, request):
-    db = get_db(data)
-    mongo_query = request.mongo_match
-    mongo_scores = {}
-    images = None
-    if mongo_query:
-        if mongo_query["filters"] or mongo_query["must_not"]:
-            find_query = {
-                **mongo_query["filters"],
-                **mongo_query["must_not"],
-            }
-            # print("[green]Filter Mongo Query[/green]", find_query)
-            image_cursor = image_collection(db).find(find_query, {"image": 1})
-            images = {doc["image"] for doc in image_cursor}
-            # print("[green]Filtered images found[/green]", len(images))
-
-        if mongo_query["scores"]:
-            try:
-                find_query = {
-                    **mongo_query["scores"],
-                    **mongo_query["filters"],
-                }
-                # print("[green]Score Mongo Query[/green]", find_query)
-                image_cursor = image_collection(db).find(
-                    find_query, {"image": 1, "score": {"$meta": "textScore"}}
-                )
-                for doc in image_cursor:
-                    mongo_scores[doc["image"]] = doc["score"]
-                print("[green]Images with scores found[/green]", len(mongo_scores))
-            except Exception as e:
-                print("[red]Error in getting scores[/red]", e)
-    return images, mongo_scores
-
-
 async def get_segments_only(
-    main_text: str, filters: EatingFilters, data: Data
+    main_text: str, filters: SearchFilters, data: Data
 ) -> Tuple[List[Event], int, List[bool], HeatmapResults | None]:
     """
     Get the segments only
@@ -289,6 +258,7 @@ async def get_segments_only(
     # segment_res = get_segments(main_text, data, max_gap=5, filters=images, to_merge=True)
     segment_res = await get_segments_related_to_text(main_text, data, filters=images)
     eating = []
+
     if not segment_res["segments"]:
         print("[red]No segments found[/red]")
         # return the full list of images
@@ -339,44 +309,6 @@ async def get_segments_only(
     return events, len(images), eating, segment_res["heatmap"]
 
 
-class AnswerModel(BaseModel):
-    enabled: bool = True
-    top_k: int = 10
-
-
-class AnswerModelOption(RootModel):
-    root: Dict[str, AnswerModel]
-
-    def get(self, key: str, default: Any = None):
-        return self.root.get(key, default)
-
-
-class RetryException(Exception):
-    pass
-
-
-async def get_answer_models(question: str) -> AnswerModelOption:
-    prompt = ANSWER_MODEL_CHOOSING_PROMPT.format(question=question)
-    answer_models = AnswerModelOption({"text": AnswerModel(), "visual": AnswerModel()})
-    tries = 0
-    while tries < 3:
-        res = await llm_model.generate_from_text(prompt)
-        try:
-            if not res:
-                raise Exception("Empty response")
-            answer_models = AnswerModelOption.model_validate(res["answer_models"])
-            break
-        except Exception:
-            print(res)
-            tries += 1
-            if tries == 3:
-                print("[red]Failed to get the answer models[/red]")
-                break
-            await asyncio.sleep(0)
-        finally:
-            pass
-    return answer_models
-
 
 @async_generator_timer("single_query")
 async def perform_full_search(
@@ -387,8 +319,9 @@ async def perform_full_search(
     """
     now = time.time()
     text: str = request.main
-    filters: EatingFilters = request.filters or EatingFilters()
+    filters: SearchFilters = request.filters or SearchFilters()
     data: Data = request.data or Data.LSC23
+    print("[green]Data[/green]", data)
     pipeline: Optional[SearchPipeline] = request.pipeline
     task_type: Task = request.task_type or Task.NONE
     edit_search = request.edit_search
@@ -425,7 +358,7 @@ async def perform_full_search(
                     ),
                     FunctionWithArgs(
                         function=parse_query,
-                        kwargs={"text": text, "eating_filters": filters},
+                        kwargs={"data": data, "text": text, "search_filters": filters},
                         use_previous_output=True,
                         output_name="query",  # ParsedQuery
                         is_async=True,
@@ -450,6 +383,7 @@ async def perform_full_search(
     skip_extract = task_type == Task.AD_HOC
     async_tasks = get_search_tasks(
         output["query"],
+        filters,
         pipeline.size,
         text,
         data,
@@ -533,7 +467,12 @@ async def perform_full_search(
             [
                 FunctionWithArgs(
                     function=limit_images_per_event,
-                    args=[results, text, pipeline.image_limiter.output["max_images"], data],
+                    args=[
+                        results,
+                        text,
+                        pipeline.image_limiter.output["max_images"],
+                        data,
+                    ],
                     output_name="results",
                 )
             ]
@@ -583,26 +522,34 @@ async def perform_full_search(
 
     print("[yellow]Answering the question...[/yellow]")
     all_answers = AnswerListResult()
-    async for answers in get_answer_tasks(
-        data,
-        text, results, relevant_fields.relevant_fields
-    ):
-        for answer in answers:
-            all_answers.add_answer(answer)
+    answers = await get_answer_tasks(
+        data, text, results, relevant_fields.relevant_fields
+    )
 
-        step.step += 1
-        step.total += 1
+    for answer in answers:
+        all_answers.add_answer(answer)
 
+    step.step += 1
+    step.total += 1
+
+    # ======================= #
+    # Test
+    if len(all_answers) > 1:
+        final_answers = await filter_answers(data, text, all_answers)
+        if final_answers:
+            all_answers = final_answers
+
+    if all_answers:
         yield Response(
             progress=step.progress(), type="answers", response=all_answers.export()
         )
-
-    if not all_answers:
+    else:
         yield Response(progress=step.progress(), type="answers", response=[])
 
 
 def get_search_tasks(
     query: ParsedQuery,
+    search_filters: SearchFilters,
     size: int,
     text: str,
     data: Data,
@@ -613,64 +560,24 @@ def get_search_tasks(
     tasks = []
 
     tasks.append(
-        simple_search(query, data, size, tag, mode=Mode.event, edit_search=edit_search)
+        simple_search(
+            query,
+            search_filters,
+            data,
+            size,
+            tag,
+            mode=Mode.event,
+            edit_search=edit_search,
+        )
     )
     if filter_fields and text:
-        tasks.append(get_relevant_fields(text, tag))
+        tasks.append(get_relevant_fields(data, text, tag))
 
     # Starting the async tasks
     async_tasks = [asyncio.create_task(task) for task in tasks]
     return async_tasks
 
 
-async def get_answer_tasks(
-    data: Data,
-    text: str,
-    results: TripletEventResults,
-    relevant_fields: List[str],
-) -> AsyncGenerator[List[AnswerResult], None]:
-    question_type = await question_classification(text)
-    print("[yellow]Question Type[/yellow]", question_type)
-    match question_type:
-        case "frequency" | "time":
-            options = {"text": AnswerModel(), "visual": AnswerModel(enabled=False)}
-        case _:
-            options = await get_answer_models(text)
-
-    print("[yellow]Answering the question with configs[/yellow]", options)
-    text_model = options.get("text", AnswerModel())
-    visual_model = options.get("visual", AnswerModel())
-
-    k = text_model.top_k
-    k = min(k, len(results.events))
-    if k == -1:
-        k = len(results.events)
-    k = max(1, k)
-    k = max(visual_model.top_k, k)
-
-    textual_descriptions = []
-    for event in results.events[:k]:
-        textual_descriptions.append(
-            get_specific_description(data, event.main, relevant_fields)
-        )
-
-    if not textual_descriptions:
-        print(f"[red]No textual descriptions found for k={k}[/red]")
-        return
-
-    print(
-        f"[green]Textual description sample out of k={k}[/green]",
-        textual_descriptions[0],
-    )
-
-    async_tasks: Sequence = [
-        answer_visual_only(text, textual_descriptions, results, 5),
-        answer_text_only(text, textual_descriptions, k),
-    ]
-
-    for task in async_tasks:
-        async for answers in task:
-            yield answers
 
 
 @async_timer("search_from_location")
@@ -825,9 +732,9 @@ async def search_similar_events(image: str, data: Data) -> Optional[EventResults
     # create labels for the events
     result = create_event_label(data, result)
 
-    result.heatmap = get_heatmap_data(
-        data, segment_result.scores, segment_result.high_score_indices
-    )
+    # result.heatmap = get_heatmap_data(
+    #     data, segment_result.scores, segment_result.high_score_indices
+    # )
 
     return result
 
@@ -852,12 +759,12 @@ async def answer_single_event(
         raise HTTPException(status_code=404, detail="Scene not found")
 
     event = DerivedEvent(**scene)
-    textual_description = get_specific_description(event, request.relevant_fields)
+    textual_description = get_specific_description(data, event, request.relevant_fields)
 
     images = [Image(**x) for x in scene["images"]]
 
     async for answers in answer_visual_with_text(
-        request.question, images, textual_description
+        data, request.question, images, textual_description
     ):
         if answers:
             for answer_dict in answers:

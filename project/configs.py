@@ -17,14 +17,14 @@ memory = Memory(location="cache", verbose=0)
 # ====================== #
 # These could be adjusted in the frontend with settings
 DEV_MODE = False
-USE_GROQ = True
+USE_GROQ = False
 DEBUG = False
-CACHE = True
+CACHE = False
 
 # Search Configurations
 # ------------------- #
 # Default search size
-DEFAULT_SIZE = 200
+DEFAULT_SIZE = 500
 
 # LLM Configurations
 # ---------------- #
@@ -35,7 +35,7 @@ QUERY_PARSER = True
 FILTER_FIELDS = True
 
 # Maximum number of images per event (0 for no limit)
-MAX_IMAGES_PER_EVENT = 10
+MAX_IMAGES_PER_EVENT = 25
 
 # Whether to merge events based on the relevant fields
 MERGE_EVENTS = True

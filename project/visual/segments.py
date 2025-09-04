@@ -1,5 +1,4 @@
 import json
-import tqdm
 import os
 import subprocess
 from typing import Dict, List, Set, Tuple, TypeVar
@@ -7,7 +6,8 @@ from typing import Dict, List, Set, Tuple, TypeVar
 import numpy as np
 import pandas as pd
 import requests
-from configs import CLIP_EMBEDDINGS, DATA_DIRECTORY
+import tqdm
+from configs import CLIP_EMBEDDINGS, DATA_DIRECTORY, DEFAULT_SIZE
 from database.main import get_db, image_collection
 from database.utils import segments_to_events
 from query_parse.types.requests import Data
@@ -46,6 +46,7 @@ def compare_images(data: Data, image1: dict, image2: dict):
         if image1["date"] != image2["date"]:
             return True
     elif data == Data.CASTLE:
+        time_gap = 5  # 5 seconds
         if image1["day"] != image2["day"]:
             return True
         if image1["person"] != image2["person"]:
@@ -90,25 +91,28 @@ def get_fixed_boundaries(data):
                     pbar.update(1)
                     if first_image:
                         boundaries.add(
-                            SIGLIP_FEATURES[data].ids.index(image_data["image"]["src"])
+                            SIGLIP_FEATURES[data].ids.index(image_data["image"])
                         )
                         first_image = False
                     elif prev_image is not None:
                         if compare_images(data, prev_image, image_data):
                             try:
                                 boundaries.add(
-                                    SIGLIP_FEATURES[data].ids.index(prev_image["image"]["src"])
+                                    SIGLIP_FEATURES[data].ids.index(prev_image["image"])
                                 )
                             except ValueError:
                                 pass
                     prev_image = image_data
+        print(boundaries)
     else:
         for image_data in image_collection(get_db(data)).find().sort(sort_criteria):
             pbar.update(1)
             if prev_image is not None:
                 if compare_images(data, prev_image, image_data):
                     try:
-                        boundaries.add(SIGLIP_FEATURES[data].ids.index(prev_image["image"]))
+                        boundaries.add(
+                            SIGLIP_FEATURES[data].ids.index(prev_image["image"])
+                        )
                     except ValueError:
                         pass
             prev_image = image_data
@@ -187,66 +191,86 @@ def create_new_segments(
 
 
 OVERWRITE_SEGMENTS = False  # Set to True to overwrite existing segments
+OVERWRITE = [Data.CASTLE]
+
+
 def load_segments(
     data: Data,
-) -> Tuple[List[Tuple[int, int]], List[List[str]], Dict[str, int], List[Event]]:
-    try:
-        print(f"Loading segments for {data}...")
-        if data == Data.LSC23:
-            path = f"{CLIP_EMBEDDINGS}/{data}/google-siglip-so400m-patch14-384_nonorm"
-        else:
-            path = f"{CLIP_EMBEDDINGS}/{data}/siglip-so400m-patch14-384"
-        photo_ids = pd.read_csv(f"{path}/photo_ids.csv")["photo_id"].tolist()
+) -> Tuple[List[Tuple[int, int]], List[List[str]], Dict[str, int], List[str]]:
+    print(f"Loading segments for {data}...")
+    if data == Data.LSC23:
+        path = f"{CLIP_EMBEDDINGS}/{data}/google-siglip-so400m-patch14-384_nonorm"
+    else:
+        path = f"{CLIP_EMBEDDINGS}/{data}/siglip-so400m-patch14-384"
+    # else:
+    #     path = f"{CLIP_EMBEDDINGS}/{data}/blip2_lavis"
+    photo_ids = pd.read_csv(f"{path}/photo_ids.csv")["photo_id"].tolist()
 
-        segment_path = f"{DATA_DIRECTORY}/{data}_segments.json"
-        if not OVERWRITE_SEGMENTS and os.path.exists(segment_path):
-            segments = json.load(open(f"{DATA_DIRECTORY}/{data}_segments.json"))
-        else:
-            segments = create_new_segments(
-                data, photo_ids, np.load(f"{path}/features.npy"), blurred_indices[data]
-            )
-            # save segments to file
-            with open(segment_path, "w") as f:
-                json.dump(segments, f)
-
-        # segments = [(segment[0], segment[1]) for segment in segments]
-        rprint(f"[green]Found {len(segments)} segments for {data}.[/green]")
-
-        segment_photos = []
-        photo_to_segment_id = {}
-        used = set()
-        print(segments[-1])
-        for segment_id, (start, end) in enumerate(segments):
-            segment_photos.append(photo_ids[start:end])
-            for photo_id in photo_ids[start:end]:
-                photo_to_segment_id[photo_id] = segment_id
-                used.add(photo_id)
-
-        # Check if all photo_ids are used
-        all_photo_ids = set(photo_ids)
-        if all_photo_ids != used:
-            rprint(
-                f"[orange]Warning: Not all photo IDs are used in segments for {data}.[/orange]"
-            )
-            unused_photos = all_photo_ids - used
-            print(f"Unused photo IDs: {len(unused_photos)}")
-
-        events = segments_to_events(
-            data,
-            segments,
-            [1] * len(segments),
-            photo_ids,
+    segment_path = f"{DATA_DIRECTORY}/{data}_segments.json"
+    to_overwrite = OVERWRITE_SEGMENTS and data in OVERWRITE
+    if not to_overwrite and os.path.exists(segment_path):
+        segments = json.load(open(f"{DATA_DIRECTORY}/{data}_segments.json"))
+    else:
+        segments = create_new_segments(
+            data, photo_ids, np.load(f"{path}/features.npy"), blurred_indices[data]
         )
+        # save segments to file
+        with open(segment_path, "w") as f:
+            json.dump(segments, f)
 
-        return segments, segment_photos, photo_to_segment_id, events
-    except Exception as e:
-        raise (e)
-        rprint(f"[red]Error loading segments for {data}: {e}[/red]")
-        return [], [], {}, []
+    # segments = [(segment[0], segment[1]) for segment in segments]
+    rprint(f"[green]Found {len(segments)} segments for {data}.[/green]")
+    average_length = np.mean([end - start for start, end in segments])
+    rprint(f"[green]Average segment length: {average_length:.2f} photos.[/green]")
+
+    segment_photos = []
+    photo_to_segment_id = {}
+    used = set()
+    print("Last segment:", segments[-1])
+    for segment_id, (start, end) in enumerate(segments):
+        segment_photos.append(photo_ids[start:end])
+        for photo_id in photo_ids[start:end]:
+            photo_to_segment_id[photo_id] = segment_id
+            used.add(photo_id)
+
+    # Check if all photo_ids are used
+    all_photo_ids = set(photo_ids)
+    if all_photo_ids != used:
+        rprint(
+            f"[orange]Warning: Not all photo IDs are used in segments for {data}.[/orange]"
+        )
+        unused_photos = all_photo_ids - used
+        print(f"Unused photo IDs: {len(unused_photos)}")
+
+    return segments, segment_photos, photo_to_segment_id, photo_ids
+
+
+class PreSegments:
+    def __init__(self, data: Data):
+        self.data = data
+        self.segments, self.segment_photos, self.photo_to_segment_id, self.photo_ids = load_segments(data)
+        self.all_events = []
+
+    @property
+    def events(self) -> List[Event]:
+        """
+        Load events only if they are not already loaded.
+        """
+        if not self.all_events:
+            batch_size = 5000
+            for i in tqdm.tqdm(
+                range(0, len(self.segments), batch_size),
+                desc=f"Loading events for {self.data}",
+            ):
+                segment_batch = self.segments[i : i + batch_size]
+                self.all_events.extend(segments_to_events(self.data, segment_batch, None, self.photo_ids))
+        return self.all_events
 
 
 presegments = {
-    data: load_segments(data) for data in [Data.LSC23, Data.Deakin, Data.CASTLE]
+    Data.LSC23: PreSegments(Data.LSC23),
+    Data.Deakin: PreSegments(Data.Deakin),
+    Data.CASTLE: PreSegments(Data.CASTLE),
 }
 
 
@@ -254,8 +278,11 @@ def get_segments_from_top_photos(
     top_photos: List[str],
     scores: List[float],
     data: Data,
+    size: int = DEFAULT_SIZE,
 ) -> Tuple[List[Tuple[int, int]], List[List[str]], List[float]]:
-    segments, _, photo_to_segment_id, _ = presegments[data]
+    segments = presegments[data].segments
+    photo_to_segment_id = presegments[data].photo_to_segment_id
+
     photo_ids = SIGLIP_FEATURES[data].ids
     blurred = blurred_indices[data]
 
@@ -276,13 +303,20 @@ def get_segments_from_top_photos(
             segment = segments[segment_id]
             valid_segments.append(segment)
             segment_photos.append(
-                [photo_ids[photo] for photo in segment if photo not in blurred]
+                [
+                    photo_ids[photo]
+                    for photo in range(segment[0], segment[1])
+                    if photo not in blurred
+                ]
             )
             segment_scores.append(score)
             done.add(segment_id)
         except (KeyError, IndexError):
             print(f"Photo ID {photo_id} not found in segments, skipping.")
             continue
+
+        if len(valid_segments) >= size:
+            break
 
     return valid_segments, segment_photos, segment_scores
 
@@ -299,7 +333,7 @@ def merge_results(
 ) -> Tuple[List[List[List[str]]], List[float]]:
     print(f"Merging results for {len(top_segment_ids)} top segments...")
     num_queries = len(all_scores)
-    *_, photo_to_segment_id, _ = presegments[Data.LSC23]
+    photo_to_segment_id = presegments[Data.LSC23].photo_to_segment_id
 
     # Step 2: Group overlapping combinations
     merged_groups = []

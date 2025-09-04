@@ -9,7 +9,7 @@ from configs import DEFAULT_SIZE, IMAGE_INDEX, SCENE_INDEX
 from nltk import defaultdict
 from pydantic import BaseModel, field_validator, model_validator
 
-from .lifelog import DateTuple, EatingFilters, Mode
+from .lifelog import DateTuple, SearchFilters, Mode
 
 # ====================== #
 # ELASTICSEARCH
@@ -678,7 +678,7 @@ class ESBoolQuery(ESQuery):
     """
 
     query: str = ""
-    filters: EatingFilters | None = None
+    filters: SearchFilters | None = None
     # These are defined after processing the query
     must: ESAndFilters = ESAndFilters()
     must_not: ESNotFilters = ESNotFilters()

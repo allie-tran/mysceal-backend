@@ -16,7 +16,7 @@ from pydantic import (
 )
 
 from query_parse.types.elasticsearch import GPS
-from query_parse.types.lifelog import EatingFilters
+from query_parse.types.lifelog import SearchFilters
 from query_parse.types.options import SearchPipeline
 
 # ====================== #
@@ -112,7 +112,7 @@ class GeneralQueryRequest(TemplateRequest):
     after_time: str = "1h"
 
     # Optional filters
-    filters: Optional[EatingFilters] = None
+    filters: Optional[SearchFilters] = None
 
     # Optional spatial queries
     gps_bounds: Optional[List[float]] = None

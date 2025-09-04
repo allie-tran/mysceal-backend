@@ -1,6 +1,5 @@
 # Get general textual description for a scene
 
-from collections.abc import AsyncGenerator
 from typing import List, Optional
 
 from configs import DURATION_FIELDS, LOCATION_FIELDS, TIME_FIELDS
@@ -10,6 +9,8 @@ from query_parse.time import calculate_duration
 from query_parse.types.requests import Data
 from results.models import AnswerListResult, AnswerResult, Event
 from rich import print as rprint
+
+from transcripts.main import find_transcript
 
 
 def get_general_textual_description(data: Data, event: Event) -> str:
@@ -52,25 +53,33 @@ def get_general_textual_description(data: Data, event: Event) -> str:
     if event.ocr:
         ocr = f"Some texts that can be seen from the images are: {' '.join(event.ocr)}."
 
-    if data == Data.LSC23:
-        textual_description = (
-            f"The event happened {time}{duration} on {date} "
-            + f"{location}{location_info} in {region} in {event.country}. {ocr}"
-        )
-    elif data == Data.Deakin:
-        textual_description = (
-            f"The event happened {time}{duration} on {date}. This is from patient {event.user_id} "
-        )
-    elif data == Data.CASTLE:
-        date = event.start_time.strftime("%d")
-        textual_description = (
-            f"The event is seen from {event.user_id}'s POV camera, happened {time}{duration} on day {date} "
-        )
+    match data:
+        case Data.LSC23:
+            textual_description = (
+                f"The event happened {time}{duration} on {date} "
+                + f"{location}{location_info} in {region} in {event.country}. {ocr}"
+            )
+        case Data.Deakin:
+            textual_description = f"The event happened {time}{duration} on {date}. This is from patient {event.user_id} "
+        case Data.CASTLE:
+            date = event.start_time.strftime("%d")
+            transcript = find_transcript(date, event.user_id, event.start_time, event.end_time)
+            start = event.start_time.strftime("day %d, %H:%M")
+            end = event.end_time.strftime("day %d, %H:%M")
+            time = f" from {start} to {end} "
+            people_present = (
+                f'People present: {", ".join(event.people_present)}'
+                if event.people_present
+                else ""
+            )
+            textual_description = f"The event is seen from {event.user_id}'s POV camera, happened {time}{duration} on day {date}. {ocr}. {people_present}. The transcript of the event is {transcript}."
     return textual_description
 
 
 # Get textual description for a scene
-def get_specific_description(data: Data, event: Event, fields: Optional[List[str]] = None) -> str:
+def get_specific_description(
+    data: Data, event: Event, fields: Optional[List[str]] = None
+) -> str:
     if fields is None:
         return get_general_textual_description(data, event)
 
@@ -115,24 +124,37 @@ def get_specific_description(data: Data, event: Event, fields: Optional[List[str
 
     match data:
         case Data.LSC23:
-            textual_description = f"This event happened{time}{duration}{location}. {visual}"
-        case Data.Deakin:
             textual_description = (
-                f"This event happened{time}{duration} for patient {event.user_id}. {visual}"
+                f"This event happened{time}{duration}{location}. {visual}"
             )
+        case Data.Deakin:
+            textual_description = f"This event happened{time}{duration} for patient {event.user_id}. {visual}"
         case Data.CASTLE:
             date = event.start_time.strftime("%d")
-            textual_description = (
-                f"This event is seen from {event.user_id}'s POV camera, happened{time}{duration} on day {date}. {visual}"
+            transcript = find_transcript(
+                date, event.user_id, event.start_time, event.end_time
             )
-        case _:
-            raise ValueError(f"Unsupported data type: {data}")
+            transcript = f"Transcript: {transcript}" if transcript else ""
+            people_present = (
+                f"People present: {', '.join(event.people_present)}"
+                if event.people_present
+                else ""
+            )
+            start = event.start_time.strftime("day %d, %H:%M")
+            end = event.end_time.strftime("day %d, %H:%M")
+            time = f" from {start} to {end} "
+            people_present = (
+                f"People present: {', '.join(event.people_present)}"
+                if event.people_present
+                else ""
+            )
+            textual_description = f"This event is seen from {event.user_id}'s POV camera, happened{time}{duration} on day {date}. {visual}. {people_present} {transcript}"
     return textual_description
 
 
-async def answer_text_only(
-    question: str, textual_descriptions: List[str], num_events: int
-) -> AsyncGenerator[List[AnswerResult], None]:
+def answer_text_only(
+    data: Data, question: str, textual_descriptions: List[str], num_events: int
+) -> List[AnswerResult]:
     """
     Given a natural language question and a list of scenes, returns the top k answers
     Note that the EventResults have already filtered the relevant fields
@@ -149,22 +171,23 @@ async def answer_text_only(
         events=formated_textual_descriptions,
     )
 
-    async for llm_response in llm_model.stream_from_text(prompt):
-        if llm_response:
-            try:
-                answers = [
-                    AnswerResult(
-                        text=answer["answer"],
-                        explanation=[answer["explanation"]],
-                        evidence=[int(ev) for ev in answer["evidence"]],
-                    )
-                    for answer in llm_response["answers"]
-                ]
-                rprint(answers)
-                yield answers
-            except Exception:
-                print("GROQ", llm_response)
-                pass
+    llm_response = llm_model.generate_from_text(data, prompt)
+    if llm_response:
+        try:
+            answers = [
+                AnswerResult(
+                    text=answer["answer"],
+                    explanation=[answer["explanation"]],
+                    evidence=[int(ev) for ev in answer["evidence"]],
+                    source="metadata/text",
+                )
+                for answer in llm_response["answers"]
+            ]
+            rprint(answers)
+            return answers
+        except Exception:
+            print("GROQ", llm_response)
+    return []
 
 
 def format_answer(answers: AnswerListResult) -> List[str]:
@@ -176,7 +199,6 @@ def format_answer(answers: AnswerListResult) -> List[str]:
         try:
             explanation = "\n".join(data.explanation)
             evidence = data.evidence
-
             formatted = f"<strong class='answer'>{answer}</strong>\n{explanation}\n"
 
             evidence_str = []
@@ -185,7 +207,6 @@ def format_answer(answers: AnswerListResult) -> List[str]:
                     f"<span class='evidence' data={ev}>Event {ev}</span>"
                 )
             evidence_str = ", ".join(evidence_str)
-
             formatted += evidence_str
             formatted_answers.append(formatted)
         except Exception as e:

@@ -1,33 +1,23 @@
-from pymongo import MongoClient, UpdateOne
+import glob
+import os
 from tqdm import tqdm
+# /mnt/ssd0/Images/Deakin/ID100/2021/12/06/
 
-client = MongoClient("mongodb://localhost:27017")
-db = client["castle"]
-collection = db["images"]
+DATA_DIR = "/mnt/ssd0/Images/Deakin/"
 
-BATCH_SIZE = 1000
-cursor = collection.find({"img": {"$exists": True}}, {"_id": 1, "img": 1})
-total = collection.count_documents({"img": {"$exists": True}})
+images = glob.glob(DATA_DIR + "**/._*.jpg", recursive=True)
+# remove images that starts with "."
+print(f"Found {len(images)} images that match the pattern.")
 
-bulk_ops = []
-count = 0
+print("First 10 images:")
+for img in images[:10]:
+    print(img)
 
-print("Renaming 'img' → 'image'...")
+# Remove
+for img in tqdm(images):
+    os.remove(img)  # Uncomment this line to actually remove the files
 
-for doc in tqdm(cursor, total=total):
-    bulk_ops.append(UpdateOne(
-        {"_id": doc["_id"]},
-        {
-            "$set": {"image": doc["img"]},
-            "$unset": {"img": ""}
-        }
-    ))
 
-    if len(bulk_ops) == BATCH_SIZE:
-        collection.bulk_write(bulk_ops, ordered=False)
-        bulk_ops = []
 
-if bulk_ops:
-    collection.bulk_write(bulk_ops, ordered=False)
 
-print(f"✅ Renamed 'img' to 'image' in {total} documents.")
+

@@ -7,10 +7,11 @@ from typing import Dict, List, TypedDict
 
 from configs import QUERY_PARSER
 from llm import small_llm_model, llm_model
-from llm.prompt.parse import QUERY_PARSE_PROMPT, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION, SPLIT_QUERY_PROMPT
+from llm.prompt.parse import PARSE_FILTERS, QUERY_PARSE_PROMPT, QUESTION_CLASSIFICATION, REWRITE_QUERY, REWRITE_QUESTION, SPLIT_QUERY_PROMPT
 from rich import print as rprint
 
-from query_parse.types.lifelog import EatingFilters, ParsedQuery, SingleQuery
+from query_parse.types.lifelog import SearchFilters, ParsedQuery, SingleQuery
+from query_parse.types.requests import Data
 
 from .constants import AUXILIARY_VERBS, QUESTION_WORDS, STOP_WORDS
 
@@ -38,7 +39,7 @@ def detect_question(query: str) -> bool:
     return False
 
 
-async def question_to_retrieval(text: str, is_question: bool) -> str:
+async def question_to_retrieval(data: Data, text: str, is_question: bool) -> str:
     """
     Convert a question to a retrieval query
     """
@@ -47,7 +48,7 @@ async def question_to_retrieval(text: str, is_question: bool) -> str:
 
     prompt = REWRITE_QUESTION.format(question=text)
     print("Converting question to retrieval query")
-    search_text = await small_llm_model.generate_from_text(prompt)
+    search_text = small_llm_model.generate_from_text(data, prompt)
     if isinstance(search_text, dict) and "text" in search_text:
         search_text = search_text["text"]
     if search_text and isinstance(search_text, str):
@@ -66,11 +67,16 @@ def detect_simple_query(query: str) -> bool:
 
 
 async def parse_query(
-    text: str, is_question: bool, eating_filters: EatingFilters | None = None
+    data: Data,
+    text: str, is_question: bool, search_filters: SearchFilters | None = None
 ) -> ParsedQuery:
     """
     Get the relevant fields from the query
     """
+
+    text = text.strip()
+    text = text.replace('‘', "'").replace('’', "'")  # replace fancy quotes with regular quotes
+
     # template = {
     # 	"main": defaultdict(lambda: search_text),
     # 	"after": defaultdict(str),
@@ -95,41 +101,39 @@ async def parse_query(
     # main = SingleQuery(visual=text, location=text, time=text, date=text)
     # return ParsedQuery(main=main)
 
-    if QUERY_PARSER or is_question or eating_filters:
+    if QUERY_PARSER or is_question or search_filters:
         # in some cases, it's inefficient to parse the query
-        if eating_filters is None and detect_simple_query(text):
+        if search_filters is None and detect_simple_query(text):
             main = SingleQuery(visual=text, location=text, time=text, date=text)
             return ParsedQuery(queries=[main], main_event=0)
 
-        res = await lsc25_get_parse_queries(text)
+        res = await lsc25_get_parse_queries(data, text)
         events = res.get("events", [])
+        filters = res.get("filters", {})
         parsed = ParsedQuery(queries=[], main_event=res.get("main_event", 0))
+        if filters:
+            print("Filters found in the response:", filters)
+            if search_filters is None:
+                search_filters = filters
+            else:
+                for key, value in filters.model_dump().items():
+                    if hasattr(search_filters, key):
+                        setattr(search_filters, key, value)
         for event in events:
+
             partial_query = SingleQuery(
                 full_text=event.get("event", ""),
                 visual=event.get("visual", ""),
                 location=event.get("location", ""),
                 time=event.get("time", ""),
                 date="",
-                filters=eating_filters or EatingFilters(),
+                filters=search_filters or SearchFilters(),
             )
             parsed.queries.append(partial_query)
         return parsed
 
-    main = SingleQuery(visual=text, location=text, time=text, date=text, filters=eating_filters or EatingFilters())
+    main = SingleQuery(visual=text, location=text, time=text, date=text, filters=search_filters or SearchFilters())
     return ParsedQuery(queries=[main], main_event=0)
-
-async def rewrite_query(eating_filters, text):
-    eating_query = eating_filters.format() if eating_filters else ""
-    if eating_query:
-        eating_query = f"Eating filters: {eating_query}"
-
-    prompt = REWRITE_QUERY.format(query=text, eating_filters=eating_query)
-    search_text = await llm_model.generate_from_text(prompt)
-    if isinstance(search_text, dict) and "text" in search_text:
-        print(search_text)
-        text = search_text["text"]
-    return text, eating_query
 
 class ParsedQueryResult(TypedDict):
     """
@@ -137,18 +141,20 @@ class ParsedQueryResult(TypedDict):
     """
     queries: List[Dict[str, str]]
     main_event: int
+    filters: SearchFilters
 
-async def lsc25_get_parse_queries(hint)-> ParsedQueryResult:
-    parsed = await llm_model.generate_from_text(QUERY_PARSE_PROMPT.format(query=hint))
+async def lsc25_get_parse_queries(data: Data, hint: str)-> ParsedQueryResult:
+    parsed = llm_model.generate_from_text(data, QUERY_PARSE_PROMPT.format(query=hint))
+
     if parsed is None:
         rprint("[red]No results found for the query parsing. Using the hint as the event.[/red]")
         parsed = {"temporal_events": [hint], "max_time": 0, "main_event": 0}
 
-    results = await llm_model.generate_from_text(SPLIT_QUERY_PROMPT.format(
+    results = llm_model.generate_from_text(data, SPLIT_QUERY_PROMPT.format(
         summary=hint,
         events="\n".join(parsed.get("temporal_events", [])),
-        model="gpt-4o"
     ))
+
     print("Results from query splitting:", results)
     if not results:
         rprint("[red]No results found for the query splitting. Using the hint as the event.[/red]")
@@ -162,10 +168,27 @@ async def lsc25_get_parse_queries(hint)-> ParsedQueryResult:
         ], "max_time": 0, "main_event": 0}
     results["max_time"] = parsed.get("max_time", 0)
     results["main_event"] = parsed.get("main_event", 0)
+
+
+    if data == Data.CASTLE:
+        search_filters = SearchFilters()
+        res = llm_model.generate_from_text(
+            data,
+            PARSE_FILTERS.format(query=hint)
+        )
+        print("Results from filter parsing:", res)
+        if isinstance(res, dict) and "filters" in res:
+            filters = res["filters"]
+            for key, value in filters.items():
+                if hasattr(search_filters, key):
+                    setattr(search_filters, key, value)
+
+        results["filters"] = search_filters
+
     return results  # type: ignore
 
 
-async def question_classification(question):
+async def question_classification(data, question):
     FREQUENCY_QUESTION = ["how often", "how many times", "how frequently"]
     TIME_QUESTION = ["when", "what time", "how long", "how much time", "what date", "what month", "how long"]
     LOCATION_QUESTION = ["where", "what place", "what location", "what area", "what city", "what country", "which country", "which city", "which area", "name of the place", "name of the location", "name of the area", "name of the city", "name of the country"]
@@ -179,14 +202,9 @@ async def question_classification(question):
         return "location"
 
     prompt = QUESTION_CLASSIFICATION.format(question=question)
-    response = await small_llm_model.generate_from_text(prompt)
+    response = small_llm_model.generate_from_text(data, prompt)
     if isinstance(response, dict) and "category" in response:
         return response["category"]
     else:
         rprint(response)
         return "visual"
-
-
-
-
-

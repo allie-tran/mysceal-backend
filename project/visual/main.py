@@ -1,4 +1,5 @@
 import os
+import requests
 import pickle
 from typing import List, Tuple
 
@@ -82,7 +83,7 @@ class ClipModel:
 
         self.features = VIT14_CLIP_FEATURES
 
-    def encode_text(self, main_query: str, normalize: bool = True) -> np.ndarray:
+    def encode_text(self, main_query: str, normalize: bool = True) -> Array1D[np.float32]:
         with torch.no_grad():
             sentences = _split_text(main_query, 77)
             tokens = self.tokenizer(sentences).to(device)
@@ -169,7 +170,7 @@ def normalize_scores(scores: Array1D[np.float32]) -> Array1D[np.float32]:
         return scores
     return (scores - np.min(scores)) / (np.max(scores) - np.min(scores))
 
-bnb_config = BitsAndBytesConfig(load_in_4bit=True)
+# bnb_config = BitsAndBytesConfig(load_in_4bit=True)
 
 class SIGLIP(ClipModel):
     def __init__(self):
@@ -178,7 +179,7 @@ class SIGLIP(ClipModel):
             "google/siglip-so400m-patch14-384",
             device_map=device,
             attn_implementation="sdpa",
-            quantization_config=bnb_config,
+            # quantization_config=bnb_config,
 
         )
         processor = AutoProcessor.from_pretrained(
@@ -195,6 +196,7 @@ class SIGLIP(ClipModel):
 
     @timer("load_lsc25_feat")
     def load_lsc25_feat(self):
+        print("[blue]Loading LSC25 features...[/blue]")
         # Precompute once for all test queries
         beta = 20
         self.beta = beta
@@ -251,6 +253,7 @@ class SIGLIP(ClipModel):
 
         self.lsc25_feat_loaded = True
 
+    @timer("encode_text")
     def encode_text(self, main_query: str, normalize=False) -> Array1D[np.float32]:
         sentences = _split_text(main_query, 77)
         inputs = self.processor(
@@ -332,7 +335,7 @@ class SIGLIP(ClipModel):
                 )
                 # normalize similarities so that the maximum value is 1 and the minimum value is 0
                 alpha = 0.8
-                similarities: Array1D[np.float32] = alpha * similarities + (1 - alpha) * location_similarities
+                similarities: Array1D[np.float32] = alpha * similarities + (1 - alpha) * location_similarities  # type: ignore
             else:
                 print("[blue]No location similarities found[/blue]")
 
@@ -340,7 +343,7 @@ class SIGLIP(ClipModel):
             time_query = f"{query.time} {query.date}".strip()
             time_query = time_query or query.full_text
             # get time heatmap
-            matrix = await get_time_heatmap(time_query)
+            matrix = get_time_heatmap(time_query)
             if matrix is not None:
                 probabilities = map_matrix_to_photos(matrix, self.times)
                 non_zero_indices = np.where(probabilities > 0.0)[0]
@@ -362,9 +365,33 @@ class SIGLIP(ClipModel):
 
         return similarities
 
+class BLIP2(SIGLIP):
+
+    def __init__(self):
+        self.name = "blip2"
+        self.lsc25_feat_loaded = False
+        self.features = SIGLIP_FEATURES
+
+    def load_lsc25_feat(self):
+        return
+
+    def encode_text(self, main_query: str, normalize=False) -> Array1D[np.float32]:
+        response = requests.post(
+            "http://localhost:8001/embedding",
+            json={"query": main_query, "norm": normalize}
+        )
+        return np.array(response.json(), dtype=np.float32)
+
+    def encode_image(self, image_path: str, data: Data) -> Array1D[np.float32]:
+        response = requests.post(
+            "http://localhost:8001/feature",
+            json={"photo_id": image_path}
+        )
+        return np.array(response.json(), dtype=np.float32)
 
 # clip_model = ClipModel()
 siglip_model = SIGLIP()
+# blip2_model = BLIP2()
 
 # clip_model.load_data()
 # siglip_model.load_data()
@@ -372,6 +399,8 @@ siglip_model.load_lsc25_feat()
 
 
 def get_model(data: Data):
+    # if data == Data.CASTLE:
+    #     return blip2_model
     return siglip_model
     # if data == Data.LSC23:
     #     return siglip_model

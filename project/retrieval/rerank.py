@@ -39,7 +39,7 @@ class Reranker:
             os.path.join(IMAGE_DIRECTORY, data, image_path)
             for image_path in image_paths
         ]
-        collage = get_collage_image(image_paths)
+        collage = get_collage_image(data, image_paths)
         if not collage:
             return 0.0
         if not prompt:

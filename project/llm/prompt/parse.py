@@ -1,4 +1,3 @@
-
 # Rewrite the question into a search query
 REWRITE_QUESTION = """
 Rewrite the following question into a statement as a retrieval query: {question}
@@ -129,7 +128,7 @@ Response:
 REWRITE_QUERY = """
 I need to rewrite the following information into a single search query to find the relevant information from the lifelog retrieval system.
 {query}
-{eating_filters}
+{search_filters}
 Response in the following format:
 ```json
 {{
@@ -161,7 +160,7 @@ If there are some eating filters, please rephrase the query to include them.
 Now it's your turn. Use no comments.
 Provide the relevant fields for the following query:
 Query:{query}
-{eating_filters}
+{search_filters}
 Response:
 """
 
@@ -400,7 +399,7 @@ Return a JSON object with the following format:
             "event": "repeat the query",
             "visual": "what can be seen in the image(s) captured in the event",
             "time": (only absolute or time-mappable expressions).
-            "location": (address, location, or GPS detectable location)
+            "location": (address, location, or GPS detectable location),
         }},
         {{
             "event": "here is an example query",
@@ -558,3 +557,26 @@ Return the JSON in this format:
   "main_event": 1
 }}
 """
+
+PARSE_FILTERS = """
+You are given a natural language query that contains some filters to apply to the search. Your task is to extract the filters from the query and return them in a JSON format.
+
+The filters can be of the following types:
+- user_id: the name of the person whose POV camera was used to capture the event
+- people_present: the names of the people who were present in the event
+
+Here are all the cameras (for user_id)
+Allie, Luca, Bjorn, Stevan, Onanong, Bao, Tien, Linh, Cathal, Werner, Klaus, Florian, Living1, Living3, Meeting, Kitchen
+
+The query: {query}
+
+Return the filters in the following format:
+```json
+{{
+    "filters": {{
+        "user_id": ["user1", "user2"],
+        "people_present": ["person1", "person2"]
+    }}
+}}
+"""
+

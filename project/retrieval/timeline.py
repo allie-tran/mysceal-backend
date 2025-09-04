@@ -1,5 +1,5 @@
-from datetime import datetime
 import traceback
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from database.main import get_db, group_collection, image_collection, scene_collection
@@ -12,6 +12,7 @@ from results.models import (
     TimelineResult,
     TimelineScene,
 )
+from visual.segments import get_keyframes_from_segments, presegments
 
 
 def get_timeline(image: str, data: Data = Data.LSC23) -> Optional[TimelineResult]:
@@ -32,25 +33,86 @@ def get_timeline(image: str, data: Data = Data.LSC23) -> Optional[TimelineResult
             return None
 
         highlight = HighlightItem(**image_info)
-        image_date = image_info["time"]
+        match data:
+            case Data.LSC23:
+                image_date = image_info["time"]
+            case Data.CASTLE:
+                image_date = image_info["utc_time"]
+            case Data.Deakin:
+                image_date = image_info["snap"]["utc_time"]
+
         start_time = image_date.replace(hour=0, minute=0, second=0)
         end_time = image_date.replace(hour=23, minute=59, second=59)
 
-        # Get all groups of the same day
-        group_ids = group_collection(db).find(
-            {
-                "$or": [
-                    {"start_time": {"$gte": start_time, "$lte": end_time}},
-                    {"end_time": {"$gte": start_time, "$lte": end_time}},
-                ]
-            },
-            {"group": 1},
-        )
-        group_range_ids: List[str] = [group["group"] for group in group_ids]
-        print("Getting scenes for group ids")
-        results = get_scene_for_group_ids(group_range_ids)
-        print("OK")
-        return TimelineResult(date=start_time, result=results, highlight=highlight)
+        if data == Data.LSC23:
+            # Get all groups of the same day
+            group_ids = group_collection(db).find(
+                {
+                    "$or": [
+                        {"start_time": {"$gte": start_time, "$lte": end_time}},
+                        {"end_time": {"$gte": start_time, "$lte": end_time}},
+                    ]
+                },
+                {"group": 1},
+            )
+            group_range_ids: List[str] = [group["group"] for group in group_ids]
+            print("Getting scenes for group ids")
+            results = get_scene_for_group_ids(group_range_ids)
+            print("OK")
+            return TimelineResult(date=start_time, result=results, highlight=highlight)
+        elif data == Data.CASTLE:
+            start_time = image_date - timedelta(minutes=10)
+            end_time = image_date + timedelta(minutes=10)
+            person = image_info["person"]
+            images = image_collection(db).find(
+                {"person": person, "utc_time": {"$gte": start_time, "$lte": end_time}},
+                {"image": 1, "utc_time": 1, "person": 1},
+            )
+            photo_to_segment_id = presegments[data].photo_to_segment_id
+            events = presegments[data].events
+            segments = []
+            used_segments = set()
+            for photo in images:
+                segment_id = photo_to_segment_id.get(photo["image"])
+                if segment_id:
+                    if segment_id in used_segments:
+                        continue
+
+                    segments.append(events[segment_id])
+                    used_segments.add(segment_id)
+
+            results = []
+            highlight = HighlightItem(image=image, scene="", group="")
+            for i, event in enumerate(segments):
+                day = event.start_time.strftime("%d")
+                start = event.start_time.strftime("%H:%M")
+                end = event.end_time.strftime("%H:%M")
+                person = event.user_id
+                time_info = f"day{day}. {start} - {end}"
+                images = set(i["image"] for i in event.images)
+                if image in images:
+                    highlight.group = str(i)
+                    highlight.scene = str(i)
+                results.append(
+                    TimelineGroup(
+                        time_info=[time_info],
+                        group=str(i),
+                        scenes=[
+                            TimelineScene(
+                                scene=str(i),
+                                images=event.images,
+                                keyframes=get_keyframes_from_segments(
+                                    None, data, event.images
+                                ),
+                            )
+                        ],
+                        location=person,
+                        location_info=f"day{day}",
+                    )
+                )
+            return TimelineResult(date=start_time, result=results, highlight=highlight)
+        elif data == Data.Deakin:
+            raise NotImplementedError("Deakin data not implemented yet")
     except Exception:
         traceback.print_exc()
 
@@ -84,10 +146,14 @@ def get_scene_for_group_ids(
     for group in grouped_results:
         scenes: List[TimelineScene] = []
 
-        for scene, images, keyframes in zip(group["scenes"], group["images"], group["keyframes"]):
+        for scene, images, keyframes in zip(
+            group["scenes"], group["images"], group["keyframes"]
+        ):
             images = [Image.model_validate(image) for image in images]
             keyframes = [Image.model_validate(keyframe) for keyframe in keyframes]
-            scenes.append(TimelineScene(scene=scene, images=images, keyframes=keyframes))
+            scenes.append(
+                TimelineScene(scene=scene, images=images, keyframes=keyframes)
+            )
 
         group["scenes"] = scenes
         group_obj = TimelineGroup(**group)

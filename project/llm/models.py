@@ -1,11 +1,20 @@
-import asyncio
+import base64
+import traceback
 import json
+import logging
+from math import ceil
 import os
 from collections.abc import Sequence
-from typing import AsyncGenerator, Dict, Generator, List, Literal, Optional
+from io import BytesIO
+from typing import Dict, List, Literal, Optional
 
-from configs import DEBUG, JSON_END_FLAG, JSON_START_FLAG
-from openai import AsyncOpenAI, BaseModel
+from configs import DEBUG, IMAGE_DIRECTORY, JSON_END_FLAG, JSON_START_FLAG
+from database.requests import get_llm_outputs, save_llm_outputs
+from openai import AsyncOpenAI
+from faces.main import draw_bounding_boxes
+from results.models import Image
+from PIL import Image as PILImage
+
 from openai.types.chat import (
     ChatCompletionContentPartImageParam,
     ChatCompletionContentPartParam,
@@ -16,13 +25,12 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from partialjson.json_parser import JSONParser
-from pyrate_limiter import BucketFullException, Duration, Limiter, Rate
-from database.requests import get_llm_outputs, save_llm_outputs
-from retrieval.async_utils import async_generator_timer
+from pydantic import BaseModel
+from pyrate_limiter import Duration, Limiter, Rate
+from query_parse.types.requests import Data
 from rich import print
+from llm.prompts import (CASTLE_INSTRUCTIONS, DEAKIN_INSTRUCTIONS, LSC_INSTRUCTIONS)
 
-from llm.prompts import INSTRUCTIONS
-import logging
 logging.getLogger("pyrate_limiter").setLevel(logging.WARNING)
 
 parser = JSONParser()
@@ -38,38 +46,44 @@ OPENAI_API = os.environ.get("OPENAI_API", "")
 # MODEL_NAME = "gpt-4.1-nano-2025-04-14"
 MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 # MODEL_NAME = "gpt-4o"
+BEST_MODEL_NAME = "gpt-4o"
 SEARCH_MODEL_NAME = "gpt-4o-mini-search-preview"
 
 
 class MixedContent(BaseModel):
     type: Literal["text", "image_url"]
-    content: str
+    content: str | bytes
 
 
 class LLM:
     # Set up the template messages to use for the completion
-    template_message: ChatCompletionMessageParam = ChatCompletionSystemMessageParam(
-        role="system", content=INSTRUCTIONS
-    )
+    template_message: Dict[Data, ChatCompletionMessageParam] = {
+        Data.LSC23: ChatCompletionSystemMessageParam(
+            role="system", content=LSC_INSTRUCTIONS
+        ),
+        Data.Deakin: ChatCompletionSystemMessageParam(
+            role="system", content=DEAKIN_INSTRUCTIONS
+        ),
+        Data.CASTLE: ChatCompletionSystemMessageParam(
+            role="system", content=CASTLE_INSTRUCTIONS
+        ),
+    }
 
     def __init__(self):
         self.client = AsyncOpenAI(api_key=OPENAI_API)
         self.model_name = MODEL_NAME
 
-    async def generate(self, messages: List[ChatCompletionMessageParam], model: str | None = None):  # type: ignore
+    async def generate(
+        self, messages: List[ChatCompletionMessageParam], advanced: bool = False
+    ):
         """
         Generate completions from a list of messages
         """
-        request = await self.client.chat.completions.create(
-            model=model or self.model_name, messages=messages, stream=True
+        completion = await self.client.chat.completions.create(
+            model=BEST_MODEL_NAME if advanced else self.model_name, messages=messages
         )
 
-        async for chunk in request:
-            await asyncio.sleep(0)
-            if chunk.choices[0].delta.content is not None:
-                yield chunk.choices[0].delta.content
-
-    def __parse(self, response: str) -> Generator[Dict, None, None]:
+    def parse(self, response: str) -> Dict:
         # there might be MULTIPLE JSON objects in the response
         # we need to split them and parse them individually
         while JSON_START_FLAG in response:
@@ -82,26 +96,28 @@ class LLM:
                 response = response[end + len(JSON_END_FLAG) :]
             try:
                 json_object = parser.parse(json_object)
-                yield json_object
-            except json.JSONDecodeError:
+                return json_object
+            except json.JSONDecodeError or TypeError:
+                traceback.print_exc()
                 pass
+
         # if there is no JSON_START_FLAG, we return the response as is
         response = response.strip()
         if response:
             try:
                 json_object = parser.parse(response)
-                yield json_object
+                return json_object
             except json.JSONDecodeError:
                 print("Error parsing object")
                 print("[ERROR]", response)
-                pass
+        return {}
 
-    async def __generate_and_parse(
+    def __generate_and_parse(
         self,
         messages: List[ChatCompletionMessageParam],
         stream=False,
-        model: str | None = None,
-    ) -> AsyncGenerator[Dict, None]:
+        advanced: bool = False,
+    ) -> Dict:
         """
         Generate completions from a list of messages
         Then parse the JSON object from the completion
@@ -111,112 +127,137 @@ class LLM:
         if DEBUG:
             print("Generating completions...")
 
-        async for completion in self.generate(messages, model=model):
-            res += completion
-            response = res
-            await asyncio.sleep(0)
-
-            if DEBUG:
-                print(completion, end="")
-
-            if stream:
-                try:
-                    limiter.try_acquire("1")
-                    all_objects = {}
-                    for obj in self.__parse(response):
-                        try:
-                            all_objects.update(obj)
-                        except ValueError:
-                            pass
-                            print("Error parsing object")
-                            print("[ERROR]", obj)
-                    yield all_objects
-                except BucketFullException:
-                    continue
-
+        res = self.generate(messages, advanced=advanced)
         all_objects = {}
-        for obj in self.__parse(res):
+        if res is None:
+            return {}
+
+        assert isinstance(res, str), "Response should be a string"
+        for obj in self.parse(res) or []:
             try:
                 if obj:
                     all_objects.update(obj)
             except ValueError:
                 print("Error parsing object")
                 print("[ERROR]", obj)
-                pass
 
         if not all_objects:
             print("[red]No JSON object found in the response.[/red]")
             print(res)
 
-        yield all_objects
+        return all_objects
 
-    async def generate_from_text(
-        self, text: str, model: str | None = None
+    def generate_from_text(
+        self, data: Data, text: str, 
+        advanced: bool = False,
     ) -> Optional[Dict]:
         """
         Generate completions from text
         Then parse the JSON object from the completion
         If the completion is not a JSON object, return the text
         """
-        cached_outputs = get_llm_outputs(
-            prompt=text, model=model or self.model_name
-        )
+        model = BEST_MODEL_NAME if advanced else self.model_name
+        cached_outputs = get_llm_outputs(prompt=text, model=model)
         if cached_outputs and cached_outputs.get("output"):
             if DEBUG:
                 print("Using cached outputs")
             return cached_outputs["output"]
 
-        messages = [self.template_message]
+        messages = [self.template_message[data]]
         messages.append(ChatCompletionUserMessageParam(role="user", content=text))
-        res = None
-        async for data in self.__generate_and_parse(messages, stream=False, model=model):
-            await asyncio.sleep(0)
-            res = data
-
+        res = self.__generate_and_parse(messages, stream=False, advanced=advanced)
         # Store the output in the database
         save_llm_outputs(
             prompt=text,
-            model=model or self.model_name,
+            model=model,
             output=res,
         )
         return res
 
-    async def stream_from_text(
-        self, text: str, model: str | None = None
-    ) -> AsyncGenerator[Dict, None]:
-        """
-        Generate completions from text
-        Then parse the JSON object from the completion
-        If the completion is not a JSON object, return the text
-        """
-        messages = [self.template_message]
-        messages.append(ChatCompletionUserMessageParam(role="user", content=text))
-        async for data in self.__generate_and_parse(messages, stream=True, model=model):
-            yield data
-
-    @async_generator_timer("generate_from_mixed_media")
-    async def generate_from_mixed_media(
-        self, data: Sequence[MixedContent]
-    ) -> AsyncGenerator[Dict, None]:
-        messages = [self.template_message]
+    def generate_from_mixed_media(
+        self, data: Data, mixed_contents: Sequence[MixedContent],
+        advanced: bool = False
+    ):
+        messages = [self.template_message[data]]
         content: List[ChatCompletionContentPartParam] = []
-        for part in data:
+        for part in mixed_contents:
             if part.type == "text":
                 content.append(
-                    ChatCompletionContentPartTextParam(text=part.content, type="text")
+                    ChatCompletionContentPartTextParam(text=str(part.content), type="text")
                 )
             elif part.type == "image_url":
                 content.append(
                     ChatCompletionContentPartImageParam(
-                        image_url=ImageURL(url=part.content), type="image_url"
+                        image_url=ImageURL(url=str(part.content)), type="image_url"
                     )
                 )
         messages.append(ChatCompletionUserMessageParam(role="user", content=content))
-        async for completion in self.__generate_and_parse(messages):
-            # if DEBUG:
-            print("GPT", completion)
-            yield completion
+        return self.__generate_and_parse(messages, advanced=advanced)
 
 
 # Load the model and JSON parser
 gpt_llm_model = LLM()
+
+def to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as image_file:
+        b64 = base64.b64encode(image_file.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+
+def get_collage_image(data: Data, image_paths: List[str]):
+    if data == Data.CASTLE:
+        image_objs = draw_bounding_boxes(
+            data, image_paths
+        )
+    else:
+        image_objs = []
+        for image in image_paths:
+            try:
+                image_objs.append(PILImage.open(image))
+            except Exception:
+                print("Error opening image", image)
+                continue
+        if len(image_objs) == 0:
+            return
+
+    # join the images into a collage
+    row = ceil(len(image_objs) ** 0.5)
+    if row == 0:
+        print(f"No images to create a collage (length={len(image_objs)})")
+        return None
+    col = ceil(len(image_objs) / row)
+
+    # create a collage of images
+    min_size = (256, 256)
+
+    # Resize images to fit in a uniform grid
+    images = [img.resize(min_size) for img in image_objs]
+
+    # Create the blank collage image
+    collage_size = (min_size[0] * col, min_size[1] * row)
+    collage = PILImage.new("RGB", collage_size)
+
+    # Paste images into the collage
+    for index, img in enumerate(images):
+        x_offset = (index % col) * min_size[0]
+        y_offset = (index // col) * min_size[1]
+        collage.paste(img, (x_offset, y_offset))
+
+    return collage
+
+
+
+def get_openai_visual_message(image_paths: List[Image], data: Data = Data.LSC23) -> MixedContent | None:
+    images = [os.path.join(IMAGE_DIRECTORY, data, img.src) for img in image_paths]
+    collage = get_collage_image(data, images)
+    if not collage:
+        return None
+
+    # save the collage to a jpeg file
+    file = BytesIO()
+    collage.save(file, "JPEG")
+
+    bs64_code = base64.b64encode(file.getvalue()).decode("utf-8")
+    bs64_images = f"data:image/jpeg;base64,{bs64_code}"
+
+    return MixedContent(type="image_url", content=bs64_images)

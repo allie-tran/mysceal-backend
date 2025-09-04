@@ -26,7 +26,7 @@ from query_parse.types.elasticsearch import (
     TimeInfo,
     VisualInfo,
 )
-from query_parse.types.lifelog import EatingFilters, Mode, ParsedQuery, SingleQuery
+from query_parse.types.lifelog import SearchFilters, Mode, ParsedQuery, SingleQuery
 from query_parse.types.requests import Data
 from query_parse.visual import search_for_visual
 
@@ -39,7 +39,7 @@ class Query(BaseModel):
     time: TimeInfo = TimeInfo()
     location: LocationInfo = LocationInfo()
     visual: VisualInfo = VisualInfo()
-    eating_filters: Optional[EatingFilters] = None
+    search_filters: Optional[SearchFilters] = None
 
     location_queries: Sequence[ESCombineFilters] = []
     temporal_queries: Sequence[ESCombineFilters] = []
@@ -100,13 +100,13 @@ class ComboQuery(BaseModel):
 
 
 async def extract_info(
-    text: str, is_question: bool, data: Data, filters: EatingFilters | None = None
+    text: str, is_question: bool, data: Data, filters: SearchFilters | None = None
 ) -> ComboQuery:
-    query_parts = await parse_query(text, is_question, filters)
+    query_parts = await parse_query(data, text, is_question, filters)
     embed_model = "siglip"
 
     def extract_part(
-        part: SingleQuery | None, filters: EatingFilters | None = None
+        part: SingleQuery | None, filters: SearchFilters | None = None
     ) -> Query | None:
         if not part:
             return
@@ -154,7 +154,7 @@ async def extract_info(
             time=timeinfo,
             location=locationinfo,
             visual=visualinfo,
-            eating_filters=filters,
+            search_filters=filters,
             embed_model=embed_model,
         )
 
@@ -174,7 +174,7 @@ async def create_query(
     search_text: str,
     is_question: bool,
     data: Data,
-    filters: EatingFilters | None = None,
+    filters: SearchFilters | None = None,
 ) -> ComboQuery:
     return await extract_info(search_text, is_question, data, filters)
 
@@ -270,8 +270,8 @@ async def create_es_query(
         es.filter.append(weekday)
 
         # Eating filters
-        if query.eating_filters:
-            for field, values in query.eating_filters.iter_fields():
+        if query.search_filters:
+            for field, values in query.search_filters.iter_fields():
                 if not values:
                     continue
                 if field == "patient_id":
@@ -352,7 +352,7 @@ async def create_es_combo_query(
             query.main, ignore_limit_score, overwrite, mode
         )
         es = query.main.es.model_copy(deep=True)
-        es.filters = query.main.eating_filters
+        es.filters = query.main.search_filters
 
     if query.must_not:
         must_not = await create_must_not_query(query.must_not)

@@ -1,27 +1,22 @@
-import base64
-import os
 from collections.abc import AsyncGenerator
-from io import BytesIO
-from math import ceil
 from typing import List
 
-from configs import IMAGE_DIRECTORY
-from llm import vllm_model
+from llm import get_visual_content, vllm_model
 from llm.models import MixedContent
 from llm.prompts import MIXED_PROMPTS
-from PIL import Image as PILImage
 from query_parse.types.requests import Data
 from results.models import AnswerResult, Event, GenericEventResults, Image
 from retrieval.async_utils import async_generator_timer
 from rich import print as rprint
 
 
-async def answer_visual_only(
+def answer_visual_only(
+    data: Data,
     question: str,
     textual_descriptions: List[str],
     results: GenericEventResults,
     k: int = 10,
-) -> AsyncGenerator[List[AnswerResult], None]:
+) -> List[AnswerResult]:
     """
     Answer the question using the visual information only
     K: number of events to consider
@@ -73,9 +68,9 @@ Answer:
         zip(results.events[:k], textual_descriptions[:k])
     ):
         e = event if isinstance(event, Event) else event.main
-        message = get_openai_visual_message(e.images)
+        message = get_visual_content(e.images[:20], data=data)
         if message:
-            content.append(message)
+            content.extend(message)
             content.append(
                 MixedContent(
                     type="text",
@@ -91,29 +86,29 @@ Answer:
             content=f"\nThe question is: {question}",
         )
     )
-    task = vllm_model.generate_from_mixed_media(content)
-    async for llm_response in task:
-        try:
-            rprint(llm_response)
-            if llm_response and "answers" in llm_response:
-                answers = llm_response["answers"]
-                answer_list = []
-                for answer_dict in answers:
-                    answer: str = answer_dict["answer"]
-                    explanation: str = answer_dict["explanation"]
-                    evidence: List[int] = answer_dict["evidence"]
-                    if not is_black_listed(answer):
-                        answer_list.append(
-                            AnswerResult(
-                                text=answer,
-                                explanation=[explanation],
-                                evidence=evidence,
-                            )
-                        )
-                yield answer_list
-        except Exception as e:
-            rprint(e)
-            rprint("GPT", llm_response)
+
+    print(
+        f"[green]Answering question with visual content only (k={k}, len(content)={len(content)})[/green]"
+    )
+    llm_response = vllm_model.generate_from_mixed_media(data, content, advanced=True)
+    rprint(f"[green]LLM response received[/green]", llm_response)
+    answer_list = []
+    if llm_response and "answers" in llm_response:
+        answers = llm_response["answers"]
+        for answer_dict in answers:
+            answer: str = answer_dict["answer"]
+            explanation: str = answer_dict["explanation"]
+            evidence: List[int] = answer_dict["evidence"]
+            if not is_black_listed(answer):
+                answer_list.append(
+                    AnswerResult(
+                        text=answer,
+                        explanation=[explanation],
+                        evidence=evidence,
+                        source="visual",
+                    )
+                )
+    return answer_list
 
 
 black_list = [
@@ -153,110 +148,19 @@ def is_black_listed(answer: str) -> bool:
     return False
 
 
-async def answer_visual_one_event(
-    n: int,
-    question: str,
-    textual_description: str,
-    event: Event,
-) -> AsyncGenerator[List[AnswerResult], None]:
-    """
-    Process the question for a single event
-    """
-    image_paths = event.images
-    if len(image_paths) == 0:
-        yield []
-        return
-
-    async for answer_list in answer_visual_with_text(
-        question, image_paths, textual_description
-    ):
-        for answer_dict in answer_list:
-            try:
-                answer: str = answer_dict["answer"]
-                explanation: str = answer_dict["explanation"]
-                if not is_black_listed(answer):
-                    yield [
-                        AnswerResult(
-                            text=answer,
-                            explanation=[explanation],
-                            evidence=[n + 1],
-                        )
-                    ]
-            except Exception as e:
-                rprint(e)
-                rprint("GPT", answer_dict)
-    yield []
-
-
-def to_base64(image_path: str) -> str:
-    with open(image_path, "rb") as image_file:
-        b64 = base64.b64encode(image_file.read()).decode("utf-8")
-        return f"data:image/jpeg;base64,{b64}"
-
-
-def get_collage_image(image_paths: List[str]):
-    image_objs = []
-    for image in image_paths:
-        try:
-            image_objs.append(PILImage.open(image))
-        except Exception:
-            print("Error opening image", image)
-            continue
-    if len(image_objs) == 0:
-        return
-
-    # join the images into a collage
-    row = ceil(len(image_objs) ** 0.5)
-    col = ceil(len(image_objs) / row)
-
-    # create a collage of images
-    min_size = (256, 256)
-
-    # Resize images to fit in a uniform grid
-    images = [img.resize(min_size) for img in image_objs]
-
-    # Create the blank collage image
-    collage_size = (min_size[0] * col, min_size[1] * row)
-    collage = PILImage.new("RGB", collage_size)
-
-    # Paste images into the collage
-    for index, img in enumerate(images):
-        x_offset = (index % col) * min_size[0]
-        y_offset = (index // col) * min_size[1]
-        collage.paste(img, (x_offset, y_offset))
-
-    return collage
-
-
-def get_openai_visual_message(image_paths: List[Image], data: Data = Data.LSC23) -> MixedContent | None:
-    images = [os.path.join(IMAGE_DIRECTORY, data, img.src) for img in image_paths]
-    collage = get_collage_image(images)
-    if not collage:
-        return None
-
-    # save the collage to a jpeg file
-    file = BytesIO()
-    collage.save(file, "JPEG")
-
-    bs64_code = base64.b64encode(file.getvalue()).decode("utf-8")
-    bs64_images = f"data:image/jpeg;base64,{bs64_code}"
-
-    return MixedContent(type="image_url", content=bs64_images)
-
-
 @async_generator_timer("answer_visual_with_text")
 async def answer_visual_with_text(
-    question: str, image_paths: List[Image], textual_description: str
+    data: Data, question: str, image_paths: List[Image], textual_description: str
 ) -> AsyncGenerator[list[dict], None]:
     """
     Given a natural language question and a list of scenes, returns the top k answers
     Note that the EventResults have already filtered the relevant fields
     """
-    mixed_message = get_openai_visual_message(image_paths)
+    mixed_message = get_visual_content(image_paths, data=data)
     if not mixed_message:
         yield []
         return
-    content = [mixed_message]
+    content = mixed_message
     content.append(
         MixedContent(
             type="text",
@@ -265,11 +169,12 @@ async def answer_visual_with_text(
             ),
         )
     )
-    task = vllm_model.generate_from_mixed_media(content)
-    async for llm_response in task:
-        try:
-            if llm_response and "answers" in llm_response:
-                yield llm_response["answers"]
-        except Exception as e:
-            rprint(e)
-            rprint("GPT", llm_response)
+    task = vllm_model.generate_from_mixed_media(data, content)
+    if task:
+        for llm_response in task:
+            try:
+                if llm_response and "answers" in llm_response:
+                    yield llm_response["answers"]
+            except Exception as e:
+                rprint(e)
+                rprint("GPT", llm_response)

@@ -125,6 +125,8 @@ class RelevantFields(CamelCaseModel):
 
     @field_validator("merge_by", mode="before")
     def validate_merge_by(cls, v) -> List[str]:
+        if not v:
+            return []
         values = []
         for value in v:
             if isinstance(value, str):
@@ -135,6 +137,8 @@ class RelevantFields(CamelCaseModel):
     @field_validator("relevant_fields", "merge_by")
     @classmethod
     def change_place_to_location(cls, v) -> List[str]:
+        if v is None:
+            return []
         if "place" in v:
             v.remove("place")
             v.append("location")
@@ -161,7 +165,8 @@ class RelevantFields(CamelCaseModel):
         return self
 
 
-class EatingFilters(CamelCaseModel):
+class SearchFilters(CamelCaseModel):
+    # Deakin
     patient_id: List[str] = []
     date: List[str] = []
     mood: List[Mood] = []
@@ -170,6 +175,10 @@ class EatingFilters(CamelCaseModel):
     social_contact: List[SocialContact] = []
     eating_activity: List[EatingActivity] = []
     food: List[FoodGroup] = []
+
+    # CASTLE
+    user_id: List[str] = []
+    people_present: List[str] = []
 
     def __bool__(self) -> bool:
         return any(
@@ -182,6 +191,8 @@ class EatingFilters(CamelCaseModel):
                 self.social_contact,
                 self.eating_activity,
                 self.food,
+                self.user_id,
+                self.people_present,
             ]
         )
 
@@ -195,6 +206,8 @@ class EatingFilters(CamelCaseModel):
             "social_contact": self.social_contact,
             "eating_activity": self.eating_activity,
             "food": self.food,
+            "user_id": self.user_id,
+            "people_present": self.people_present,
         }.items()
 
     def format(self) -> str:
@@ -215,7 +228,34 @@ class EatingFilters(CamelCaseModel):
             explanation.append(f"Eating activity: {', or'.join(self.eating_activity)}")
         if self.food:
             explanation.append(f"Food: {', or'.join(self.food)}")
+        if self.user_id:
+            explanation.append(f"User ID: {', or '.join(self.user_id)}")
+        if self.people_present:
+            explanation.append(f"People present: {', or '.join(self.people_present)}")
         return "\n".join(explanation)
+
+    def export(self) -> dict:
+        """
+        Export the search filters to a dictionary
+        """
+        if self.people_present:
+            return {
+                "$or": [
+                    {"user_id": {"$in": self.user_id + self.people_present}},
+                    {"people_present": {"$in": self.people_present}},
+                ]
+            }
+
+        if self.user_id:
+            return {
+                "person": {"$in": self.user_id},
+            }
+
+        d = {
+            "patient_id": self.patient_id,
+            "date": self.date,
+        }
+        return {k: v for k, v in d.items() if v}  # Remove empty lists
 
 class SingleQuery(CamelCaseModel):
     full_text: str = ""
@@ -223,7 +263,7 @@ class SingleQuery(CamelCaseModel):
     location: str = ""
     time: str = ""
     date: str = ""
-    filters: EatingFilters = EatingFilters()
+    filters: SearchFilters = SearchFilters()
 
     def __bool__(self) -> bool:
         return any([self.visual, self.location, self.time, self.date])

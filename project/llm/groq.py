@@ -1,9 +1,10 @@
 import asyncio
+from collections.abc import Sequence
 import os
 from typing import List
 
 from groq import Groq
-from groq.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletionMessageParam
 from llm.models import LLM
 
 # Set up ChatGPT generation model
@@ -24,20 +25,17 @@ class GroqLLM(LLM):
         self.client = Groq(api_key=GROQ_AI)
         self.model_name = name
 
-    async def generate(self, messages: List[ChatCompletionMessageParam], model: str | None = None):
+    def generate(
+        self, messages: List[ChatCompletionMessageParam], model: str | None = None
+    ):
         """
         Generate completions from a list of messages
         """
-        request = self.client.chat.completions.create(
-            model=self.model_name, messages=messages, stream=True,
+        completion = self.client.chat.completions.create(
+            model=self.model_name, messages=messages,  # type: ignore
             temperature=0.1,
         )
-
-        await asyncio.sleep(0)
-        for chunk in request:
-            await asyncio.sleep(0)
-            if chunk.choices[0].delta.content is not None:
-                yield chunk.choices[0].delta.content
+        return completion.choices[0].message.content
 
 # Load the model
 groq_llm_model = GroqLLM(MODEL_NAME)

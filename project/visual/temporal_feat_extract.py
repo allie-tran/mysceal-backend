@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from llm import llm_model
+from query_parse.types.requests import Data
+from retrieval.async_utils import timer
 from retrieval.scripts import (
     TIME_BUCKETS,
     TIME_TO_IDX,
@@ -116,10 +118,12 @@ Use this JSON format:
 
 
 # %%
-async def get_time_heatmap(phrase) -> Array2D[np.float32] | None:
-    heatmap_json = await llm_model.generate_from_text(
+@timer("get_time_heatmap")
+def get_time_heatmap(phrase) -> Array2D[np.float32] | None:
+    heatmap_json = llm_model.generate_from_text(
+        Data.LSC23,
         heatmap_prompt.format(phrase=phrase, script=script),
-        model="gpt-4o"
+        advanced=True
     )
     # %%
     print("Heatmap JSON:", heatmap_json)
@@ -160,17 +164,16 @@ async def get_time_heatmap(phrase) -> Array2D[np.float32] | None:
         print("The generated heatmap matrix is empty.")
         return None
 
-    print("Generated heatmap matrix:")
+    # print("Generated heatmap matrix:")
     # generate a ascii table
-
-    for year in range(2):
-        print(f"Year {2019 + year}:")
-        for row in matrix[:, year * 365 : (year + 1) * 365]:
-            for value in row:
-                box = " " if value < 0.1 else "█" if value >= 0.5 else "▒"
-                print(box, end="")
-            print()
-        print()
+    # for year in range(2):
+    #     print(f"Year {2019 + year}:")
+    #     for row in matrix[:, year * 365 : (year + 1) * 365]:
+    #         for value in row:
+    #             box = " " if value < 0.1 else "█" if value >= 0.5 else "▒"
+    #             print(box, end="")
+    #         print()
+    #     print()
 
     return matrix  # type: ignore
 
@@ -235,6 +238,7 @@ def get_time_info(photo_ids, photo_id_to_index):
     return times
 
 
+@timer("map_matrix_to_photos")
 def map_matrix_to_photos(
     matrix: np.ndarray, times: list[datetime.datetime]
 ) -> Array1D[np.float32]:

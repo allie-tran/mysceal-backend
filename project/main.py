@@ -35,7 +35,7 @@ from database.utils import (
 from myeachtra.auth_models import get_user, verify_user
 from myeachtra.map_router import map_router
 from myeachtra.timeline_router import timeline_router
-from query_parse.types.lifelog import EatingFilters
+from query_parse.types.lifelog import SearchFilters
 from query_parse.types.requests import (
     AnswerThisRequest,
     ChoicesRequest,
@@ -52,7 +52,6 @@ from query_parse.types.requests import (
 )
 from results.lifelog_questions import create_video
 from results.models import AnswerResultWithEvent, TripletEventResults
-from retrieval.graph import get_vegalite, to_csv
 from retrieval.search import (
     answer_single_event,
     get_segments_only,
@@ -62,9 +61,6 @@ from retrieval.search import (
 from submit.router import submit_router
 from visual.main import get_model
 from visual.segments import expand_single_image, get_keyframes_from_segments
-
-logging.basicConfig(level=logging.DEBUG)
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -77,6 +73,8 @@ logging.getLogger("pyrate_limiter").setLevel(logging.WARNING)
 logging.getLogger("pymongo").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("groq").setLevel(logging.WARNING)
 
 load_dotenv(".env")
 
@@ -95,13 +93,12 @@ async def start_up(_: FastAPI):
 
 app = FastAPI(lifespan=start_up)
 origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://n-2mbzycnxd-allie-trans-projects.vercel.app",
+    # "http://localhost",
+    # "http://localhost:3000",
+    # "http://localhost:3001",
+    # "https://n-2mbzycnxd-allie-trans-projects.vercel.app",
     "https://mysceal.computing.dcu.ie",
-    "vercel.app",
-    "mysceal.computing.dcu.ie",
+    "https://dcu.allietran.com"
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -208,19 +205,6 @@ async def similarity_search(request: SimilaritySearchRequest):
     return await search_similar_events(request.image, request.data)
 
 
-@app.post(
-    "/query_to_csv",
-    description="Given a query, return the results in CSV format",
-    status_code=200,
-    response_model=str,
-)
-async def query_to_csv(query: GeneralQueryRequest):
-    """
-    Given a query, return the results in CSV format
-    """
-    csv = await to_csv(query.main, query.data)
-    return csv.to_csv(index=False)
-
 
 @app.get("/health", description="Health check endpoint", status_code=200)
 async def health():
@@ -228,20 +212,6 @@ async def health():
     Health check endpoint
     """
     return {"status": "ok"}
-
-
-@app.post(
-    "/query_to_vegalite",
-    description="Given a query, return the results in Vega-Lite format",
-    status_code=200,
-    response_model=dict,
-)
-async def query_to_vegalite(query: GeneralQueryRequest):
-    """
-    Given a query, return the results in Vega-Lite format
-    """
-    data = await get_vegalite(query.main, query.data)
-    return data
 
 
 @app.post(
@@ -316,7 +286,7 @@ async def get_segments(request: SegmentRequest):
     query = "I am eating, or preparing food, or food (or drink) is visible"
     events, num, eating, heatmap = await get_segments_only(
         query,
-        EatingFilters(patient_id=[request.patient_id], date=[request.date]),
+        SearchFilters(patient_id=[request.patient_id], date=[request.date]),
         data=request.data,
     )
     encoded_query = get_model(Data.Deakin).encode_text(query)
@@ -640,7 +610,7 @@ async def download_segments(request: SegmentRequest):
     data = []
     def image_to_time(image_src: str) -> str:
         "ID100_20211209_072207_000"
-        _, time = image_src.split("_", 1)[-1]
+        time = image_src.split("_", 1)[-1].split(".")[0]
         return datetime.strptime(time, "%Y%m%d_%H%M%S_%f").strftime("%H:%M %d-%m-%Y")
 
     for i, segment in enumerate(event_segments.segments):

@@ -1,12 +1,11 @@
 from typing import List, Optional
 
 from database.utils import segment_to_event
-from llm import vllm_model
+from llm import vllm_model, get_visual_content
 from llm.models import MixedContent
 from myeachtra.dependencies import CamelCaseModel
 from query_parse.types.requests import Data
-from question_answering.video import get_openai_visual_message
-from results.models import Event, HeatmapResults, Image
+from results.models import HeatmapResults, Image
 from rich import print as rprint
 from results.utils import basic_label
 from visual.main import encode_text
@@ -191,18 +190,17 @@ Leave the annotation blank if it is not possible to determine the annotation fro
         max_images_per_chunk = 4
         for j in range(0, len(images), max_images_per_chunk):
             chunk = images[j : j + max_images_per_chunk]
-            message = get_openai_visual_message(chunk, data=data)
+            message = get_visual_content(chunk, data=data)
             if message:
-                content.append(message)
+                content.extend(message)
 
         if len(content) > 1:
-            task = vllm_model.generate_from_mixed_media(content)
-            async for llm_response in task:
-                try:
-                    segments[i].annotations = Annotation.model_validate(llm_response)
-                    segments[i].annotations.eating = True
-                    rprint(segments[i].annotations)
-                except Exception as e:
-                    rprint(e)
-                    rprint("GPT", llm_response)
+            llm_response = vllm_model.generate_from_mixed_media(data, content)
+            try:
+                segments[i].annotations = Annotation.model_validate(llm_response)
+                segments[i].annotations.eating = True
+                rprint(segments[i].annotations)
+            except Exception as e:
+                rprint(e)
+                rprint("GPT", llm_response)
     return segments

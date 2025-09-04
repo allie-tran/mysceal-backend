@@ -1,4 +1,5 @@
 import numpy as np
+from retrieval.async_utils import timer
 from visual.types import Array1D
 
 
@@ -18,6 +19,7 @@ def get_index_to_normalize(sims, videos):
     return result
 
 
+@timer("apply_qb_norm")
 def apply_qb_norm_to_query(
     test_query_feat, features, retrieved_videos, normalizing_sum, beta
 ) -> Array1D[np.float32]:
